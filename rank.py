@@ -13,9 +13,9 @@ from bs4 import BeautifulSoup
 # pyrefly: ignore [missing-import]
 from ddgs import DDGS
 # pyrefly: ignore [missing-import]
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 # pyrefly: ignore [missing-import]
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 # pyrefly: ignore [missing-import]
 from playwright.async_api import async_playwright
 # pyrefly: ignore [missing-import]
@@ -31,7 +31,7 @@ TIMEZONE = timezone(timedelta(hours=7))   # GMT+7
 
 # Chat ID admin yang akan menerima notifikasi saat CAPTCHA Google perlu di-solve
 # Isi dengan chat_id Anda. Cari tau dengan /start ke bot, lalu lihat di log terminal.
-ADMIN_CHAT_ID = None   # Contoh: 123456789
+ADMIN_CHAT_ID = 6769855876   # Contoh: 123456789
 
 # Backend metasearch (fallback):
 BACKENDS = "google, bing, brave, duckduckgo"
@@ -717,6 +717,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/list</code> - Tampilkan semua keyword terpantau Anda\n"
         "• <code>/clear</code> - Kosongkan semua daftar keyword terpantau Anda\n"
         "• <code>/scan</code> - Jalankan semua pemantau instan sekarang\n"
+        "• <code>/menu</code> - Pilih 1 keyword untuk discan sekarang\n"
         "• <code>/solved</code> - Beritahu bot bahwa CAPTCHA Google sudah di-solve\n\n"
         f"<i>Chat ID Anda: <code>{chat_id}</code></i>",
         parse_mode="HTML"
@@ -942,6 +943,73 @@ async def solved_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def scan_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan daftar keyword sebagai tombol inline — pilih 1 untuk discan sekarang."""
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    keywords = []
+    if chat_id in data["users"]:
+        keywords = data["users"][chat_id].get("keywords", [])
+
+    if not keywords:
+        return await update.message.reply_text(
+            "📭 Daftar keyword Anda kosong.\nTambahkan dengan <code>/add [keyword]</code>.",
+            parse_mode="HTML"
+        )
+
+    # Buat tombol inline: 2 per baris, maks 50 tombol
+    buttons = []
+    row = []
+    for i, kw in enumerate(keywords[:50]):
+        row.append(InlineKeyboardButton(kw, callback_data=f"scan1:{kw}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "🔍 <b>Pilih keyword yang ingin discan sekarang:</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback saat tombol keyword di /menu ditekan."""
+    query = update.callback_query
+    await query.answer()
+
+    data_str = query.data or ""
+    if not data_str.startswith("scan1:"):
+        return
+
+    keyword = data_str[len("scan1:"):].strip()
+    if not keyword:
+        return
+
+    await query.edit_message_text(
+        f"🔍 Memindai: <b>{html.escape(keyword)}</b>\n"
+        "‣ pinging metasearch node ▓▓▓▒░░",
+        parse_mode="HTML"
+    )
+
+    results, source = await get_top5(keyword)
+
+    if not results:
+        await query.edit_message_text(
+            f"⛔ <b>Gagal memindai</b> <code>{html.escape(keyword)}</code>\n"
+            "Semua backend gagal / Google limit.",
+            parse_mode="HTML"
+        )
+        return
+
+    msg = build_cyberpunk_message(keyword, results, source)
+    # Hapus pesan loading, kirim hasil baru
+    await query.edit_message_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -950,7 +1018,9 @@ def main():
     app.add_handler(CommandHandler("clear", clear_keywords))
     app.add_handler(CommandHandler("list", list_keywords))
     app.add_handler(CommandHandler("scan", scan_all))
+    app.add_handler(CommandHandler("menu", scan_menu))
     app.add_handler(CommandHandler("solved", solved_captcha))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^scan1:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cek_keyword))
     print("Cyberpunk bot online…")
     app.run_polling()
