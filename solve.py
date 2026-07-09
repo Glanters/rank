@@ -52,14 +52,19 @@ async def main():
                 await asyncio.sleep(1)
         except KeyboardInterrupt:
             print("\nMenutup browser dan menyimpan sesi...")
-        except Exception as e:
-            print(f"\nSesi ditutup: {e}")
-        finally:
             try:
                 await context.close()
             except:
                 pass
-            print("Sesi berhasil disimpan! Sekarang Anda bisa menjalankan 'python rank.py' kembali.")
+            print("Sesi berhasil disimpan!")
+        except Exception as e:
+            err_msg = str(e)
+            print(f"\nError: Sesi gagal dijalankan: {err_msg}", file=sys.stderr)
+            if "displayName" in err_msg or "display" in err_msg or "X11" in err_msg or "Wayland" in err_msg:
+                print("\n[Bantuan] Lingkungan Anda tidak mendukung GUI (Headless / VPS tanpa layar).\n"
+                      "Silakan jalankan 'python solve.py' di PC lokal Anda (yang memiliki layar/GUI),\n"
+                      "lalu upload seluruh folder 'firefox_profile' ke VPS Anda.", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     try:
