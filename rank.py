@@ -384,12 +384,11 @@ async def get_top5(keyword):
     for attempt in range(1, 4):
         # Pilih User-Agent perangkat mobile secara acak untuk percobaan ini
         ua = random.choice(MOBILE_USER_AGENTS)
-        print(f"[Direct Search] Percobaan {attempt}/3: Menghubungi Google dengan perangkat: {ua}")
         
         playwright_proxy = None
-        if ddgs_proxy:
-            # Playwright proxy format: {'server': 'http://...', 'username': '...', 'password': '...'}
-            # Kita parsing proxy string: http://username:password@host:port
+        # Gunakan proxy pada percobaan 1 & 2. Pada percobaan 3, coba langsung tanpa proxy
+        if ddgs_proxy and attempt < 3:
+            print(f"[Direct Search] Percobaan {attempt}/3 (Dengan Proxy): Menghubungi Google dengan perangkat: {ua}")
             try:
                 parsed = urlparse(ddgs_proxy)
                 server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
@@ -400,6 +399,9 @@ async def get_top5(keyword):
             except Exception as pe:
                 print(f"[Warning] Gagal memparsing proxy untuk Playwright: {pe}")
                 playwright_proxy = None
+        else:
+            proxy_log_type = "Tanpa Proxy (Penyelamat)" if ddgs_proxy else "Tanpa Proxy"
+            print(f"[Direct Search] Percobaan {attempt}/3 ({proxy_log_type}): Menghubungi Google dengan perangkat: {ua}")
         
         try:
             async with async_playwright() as p:
