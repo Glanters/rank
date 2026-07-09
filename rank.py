@@ -230,6 +230,14 @@ def check_url_online_sync(url):
     is_amp = is_url_amp_format(url)
     original_domain = get_domain(url)
     linked_domain = None
+    # Domain CDN/aset/infrastruktur yang tidak relevan untuk pendeteksian brand
+    SKIP_DOMAINS = {
+        "fonts.googleapis.com", "fonts.gstatic.com", "googleapis.com", "gstatic.com",
+        "challenges.cloudflare.com", "cloudflare.com", "cdn.ampproject.org",
+        "jquery.com", "bootstrapcdn.com", "cdnjs.cloudflare.com",
+        "izin-join.xyz", "fb.com", "facebook.com", "twitter.com",
+        "instagram.com", "whatsapp.com", "t.me", "bit.ly", "tinyurl.com",
+    }
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -268,14 +276,23 @@ def check_url_online_sync(url):
             # Gunakan original html_chunk (case-preserved) untuk ekstrak URL
             hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_chunk, re.I)
             orig_dom_clean = original_domain.lower().replace("www.", "")
+            linked_domains = []
             for href in hrefs:
                 if not href.startswith("http"):
                     continue
                 href_domain = get_domain(href).lower().replace("www.", "")
-                # Ambil domain eksternal (bukan domain yang sedang di-scan itu sendiri)
-                if href_domain and href_domain != orig_dom_clean and len(href_domain) > 3:
-                    linked_domain = href_domain
-                    break
+                # Ambil domain eksternal yang bukan domain scan itu sendiri dan bukan CDN/aset
+                if (
+                    href_domain
+                    and href_domain != orig_dom_clean
+                    and len(href_domain) > 3
+                    and href_domain not in SKIP_DOMAINS
+                    and not any(skip in href_domain for skip in ["googleapis", "gstatic", "cloudflare", "ampproject"])
+                    and href_domain not in linked_domains
+                ):
+                    linked_domains.append(href_domain)
+            # Simpan semua domain yang ditemukan sebagai string dipisahkan koma
+            linked_domain = ",".join(linked_domains) if linked_domains else None
                 
             return True, is_amp, final_url, linked_domain
     except Exception:
@@ -502,11 +519,12 @@ def build_cyberpunk_message(keyword, results, source):
         
         orig_dom_clean = domain.lower().replace("www.", "")
         final_dom_clean = final_domain.lower().replace("www.", "")
-        linked_domain_clean = r.get("linked_domain", "").lower().replace("www.", "")
+        linked_domain_clean = r.get("linked_domain", "") or ""
         
         # Cek kepemilikan: keyword brand harus muncul di domain tujuan redirect
-        # ATAU di link tombol login/daftar di halaman tersebut
-        is_ours = (kw_clean in final_dom_clean) or (linked_domain_clean and kw_clean in linked_domain_clean)
+        # ATAU di salah satu domain link/tombol yang ada di halaman tersebut
+        linked_domain_match = any(kw_clean in d for d in linked_domain_clean.split(",") if d)
+        is_ours = (kw_clean in final_dom_clean) or linked_domain_match
         
         # 3. Emoji 3: ⭐ jika milik sendiri, 🔴 jika milik kompetitor/luar
         circle_emoji = "⭐" if is_ours else "🔴"
