@@ -1,6 +1,7 @@
+# Dependencies untuk Jembut Scanner (rank.py + solve.py)
 requests>=2.32.0
 beautifulsoup4>=4.12.0
-pandas>=2.2.0
-halo>=0.0.31
-termcolor>=2.0.0
-openpyxl>=3.1.0
+python-telegram-bot>=21.0
+playwright>=1.44.0
+playwright-stealth>=1.0.6
+ddgs>=6.0.0
