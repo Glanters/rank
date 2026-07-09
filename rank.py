@@ -483,6 +483,10 @@ async def get_top5(keyword):
                 return top5, "Google"
             else:
                 print(f"[INFO] Percobaan {attempt}: Jumlah link hasil pencarian langsung kurang ({len(top5)}) atau terblokir.")
+                # Kemungkinan kena CAPTCHA invisible / halaman kosong Google
+                if len(top5) == 0 and attempt == 3:
+                    print("[WARNING] Semua percobaan Google gagal dengan 0 hasil — kemungkinan kena CAPTCHA!")
+                    await notify_captcha_needed()
         except Exception as e:
             print(f"[Error] Gagal mengakses Google secara langsung pada percobaan {attempt}: {e}")
             
