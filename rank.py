@@ -495,9 +495,25 @@ async def get_top5(keyword):
 
     # 2. Fallback: Menggunakan Metasearch DDGS jika direct Google diblokir
     print("[Fallback] Mengalihkan pencarian ke metasearch node (Bing, Brave, DuckDuckGo)...")
+    raw = None
+    used_proxy = True
     try:
         loop = asyncio.get_running_loop()
         raw = await loop.run_in_executor(None, _ddgs_fetch, keyword, ddgs_proxy)
+    except Exception as e:
+        print(f"[Warning] Fallback metasearch dengan proxy gagal: {e}. Mencoba tanpa proxy...")
+        try:
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(None, _ddgs_fetch, keyword, None)
+            used_proxy = False
+        except Exception as e2:
+            print(f"[Error] Fallback metasearch tanpa proxy juga gagal: {e2}")
+            return [], None
+
+    if not raw:
+        return [], None
+
+    try:
         top5 = []
         for item in raw:
             url = item.get("href", "") or ""
@@ -527,9 +543,10 @@ async def get_top5(keyword):
             r["final_url"] = final_url if final_url else r["url"]
             r["final_domain"] = get_domain(r["final_url"])
             r["linked_domain"] = linked_domain or ""
-        return top5, "Bing/Brave/DDG"
+        source_name = "Bing/Brave/DDG" if used_proxy else "Bing/Brave/DDG (Direct)"
+        return top5, source_name
     except Exception as e:
-        print(f"[Error] Fallback metasearch juga gagal: {e}")
+        print(f"[Error] Gagal memproses hasil fallback metasearch: {e}")
         return [], None
 
 
