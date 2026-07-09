@@ -29,6 +29,10 @@ TELEGRAM_TOKEN = "8360476610:AAEqBzP2fLUS84LO4gdfwIcolx8PEneD7KQ"
 LOCATION = "Jakarta, Indonesia"
 TIMEZONE = timezone(timedelta(hours=7))   # GMT+7
 
+# Chat ID admin yang akan menerima notifikasi saat CAPTCHA Google perlu di-solve
+# Isi dengan chat_id Anda. Cari tau dengan /start ke bot, lalu lihat di log terminal.
+ADMIN_CHAT_ID = None   # Contoh: 123456789
+
 # Backend metasearch (fallback):
 BACKENDS = "google, bing, brave, duckduckgo"
 REGION = "id-id"
@@ -41,9 +45,45 @@ PROXY = {
 }
 # =====================================================
 
+# Flag global: apakah notifikasi CAPTCHA sudah dikirim (hindari spam)
+_captcha_notified = False
+_bot_app_ref = None   # Referensi global ke aplikasi bot
 CTR = {1: 28, 2: 15, 3: 11, 4: 8, 5: 7}
 TAG = {"amp": "[AMP]", "landing": "[LND]", "biasa": "[REG]"}
 BAR_W = 30
+
+async def notify_captcha_needed():
+    """Kirim notifikasi ke admin bahwa Google CAPTCHA perlu di-solve."""
+    global _captcha_notified, _bot_app_ref
+    if _captcha_notified or not ADMIN_CHAT_ID or not _bot_app_ref:
+        return
+    _captcha_notified = True
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔗 Buka Google untuk Solve CAPTCHA",
+                url="https://www.google.co.id/search?q=test"
+            )]
+        ])
+        await _bot_app_ref.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                "⚠️ <b>Google CAPTCHA Terdeteksi!</b>\n"
+                "──────────────────────────\n"
+                "Bot tidak bisa mengambil hasil Google karena terkena CAPTCHA.\n\n"
+                "<b>Cara solve:</b>\n"
+                "1. Klik tombol di bawah\n"
+                "2. Selesaikan CAPTCHA di browser yang terbuka\n"
+                "3. Ketik /solved di sini setelah selesai\n\n"
+                "<i>Bot akan otomatis reload cookies setelah /solved.</i>"
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        print(f"[CAPTCHA] Notifikasi dikirim ke admin (chat_id: {ADMIN_CHAT_ID})")
+    except Exception as e:
+        print(f"[CAPTCHA] Gagal mengirim notifikasi: {e}")
 
 # Pool 50 mobile User-Agents dari berbagai jenis perangkat
 MOBILE_USER_AGENTS = [
@@ -386,6 +426,7 @@ async def get_top5(keyword):
                 current_url = page.url
                 if "sorry/index" in current_url:
                     print(f"[WARNING] Percobaan {attempt} terdeteksi CAPTCHA Google! Silakan jalankan 'python solve.py' jika masalah berlanjut.")
+                    await notify_captcha_needed()
                     await context.close()
                     await asyncio.sleep(random.uniform(1.0, 2.5))
                     continue
@@ -659,9 +700,13 @@ async def cron_job(application):
         save_keywords_data(data)
 
 async def post_init(application):
+    global _bot_app_ref
+    _bot_app_ref = application
     asyncio.create_task(cron_job(application))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    print(f"[INFO] /start dari chat_id: {chat_id}")
     await update.message.reply_text(
         "🤖 <b>JEMBUT SCANNER — ONLINE</b>\n"
         "──────────────────────────────\n"
@@ -671,7 +716,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/del [keyword]</code> - Hapus keyword (bisa multi-line)\n"
         "• <code>/list</code> - Tampilkan semua keyword terpantau Anda\n"
         "• <code>/clear</code> - Kosongkan semua daftar keyword terpantau Anda\n"
-        "• <code>/scan</code> - Jalankan semua pemantau instan sekarang",
+        "• <code>/scan</code> - Jalankan semua pemantau instan sekarang\n"
+        "• <code>/solved</code> - Beritahu bot bahwa CAPTCHA Google sudah di-solve\n\n"
+        f"<i>Chat ID Anda: <code>{chat_id}</code></i>",
         parse_mode="HTML"
     )
 
@@ -842,6 +889,59 @@ async def cek_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def solved_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin konfirmasi CAPTCHA sudah di-solve, bot reload cookies via solve.py."""
+    global _captcha_notified
+    chat_id = str(update.effective_chat.id)
+    
+    # Hanya admin yang bisa akses
+    if ADMIN_CHAT_ID and int(chat_id) != ADMIN_CHAT_ID:
+        return await update.message.reply_text("⛔ Perintah ini hanya untuk admin.")
+    
+    await update.message.reply_text(
+        "🔄 <b>Menjalankan solve.py untuk reload cookies Google...</b>\n"
+        "<i>Mohon tunggu 20–30 detik.</i>",
+        parse_mode="HTML"
+    )
+    
+    try:
+        import subprocess
+        import sys as _sys
+        solve_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solve.py")
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, solve_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        
+        if proc.returncode == 0:
+            _captcha_notified = False   # Reset flag agar notif bisa dikirim lagi nanti
+            await update.message.reply_text(
+                "✅ <b>Cookies berhasil diperbarui!</b>\n"
+                "Bot akan kembali normal pada pencarian berikutnya.",
+                parse_mode="HTML"
+            )
+        else:
+            err_msg = stderr.decode(errors='ignore')[:500] if stderr else "(tidak ada output)"
+            await update.message.reply_text(
+                f"⚠️ <b>solve.py selesai dengan error:</b>\n<pre>{html.escape(err_msg)}</pre>\n"
+                "Coba jalankan <code>python solve.py</code> manual di terminal.",
+                parse_mode="HTML"
+            )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "⏱️ <b>solve.py timeout (>60 detik).</b>\n"
+            "Coba jalankan <code>python solve.py</code> manual di terminal.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ <b>Gagal menjalankan solve.py:</b> {html.escape(str(e))}",
+            parse_mode="HTML"
+        )
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -850,6 +950,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_keywords))
     app.add_handler(CommandHandler("list", list_keywords))
     app.add_handler(CommandHandler("scan", scan_all))
+    app.add_handler(CommandHandler("solved", solved_captcha))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cek_keyword))
     print("Cyberpunk bot online…")
     app.run_polling()
