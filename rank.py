@@ -715,7 +715,11 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if added:
         msg_parts.append(f"✅ <b>Berhasil memantau {len(added)} keyword baru:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in added]))
     if already_exists:
-        msg_parts.append(f"ℹ️ <b>{len(already_exists)} keyword sudah ada dalam pemantau Anda:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in already_exists]))
+        msg_parts.append(
+            f"🚫 <b>{len(already_exists)} keyword ditolak — sudah terdaftar di daftar Anda:</b>\n"
+            + "\n".join([f"- <code>{html.escape(k)}</code>" for k in already_exists])
+            + "\n\n<i>Hapus terlebih dahulu dengan /del jika ingin mengganti.</i>"
+        )
         
     await update.message.reply_text("\n\n".join(msg_parts), parse_mode="HTML")
 
