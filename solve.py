@@ -1,0 +1,68 @@
+import asyncio
+from playwright.async_api import async_playwright
+import os
+import sys
+from urllib.parse import urlparse
+from rank import PROXY, get_normalized_proxies
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+async def main():
+    profile_dir = "./firefox_profile"
+    if not os.path.exists(profile_dir):
+        os.makedirs(profile_dir)
+        
+    requests_proxies, ddgs_proxy = get_normalized_proxies()
+    playwright_proxy = None
+    if ddgs_proxy:
+        try:
+            parsed = urlparse(ddgs_proxy)
+            server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+            playwright_proxy = {"server": server}
+            if parsed.username and parsed.password:
+                playwright_proxy["username"] = parsed.username
+                playwright_proxy["password"] = parsed.password
+        except Exception as pe:
+            print(f"[Warning] Gagal memparsing proxy untuk Playwright: {pe}")
+            playwright_proxy = None
+        
+    async with async_playwright() as p:
+        print("Membuka browser Firefox dengan PROXY untuk menyelesaikan CAPTCHA Google...")
+        try:
+            context = await p.firefox.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=False,
+                proxy=playwright_proxy,
+                viewport={"width": 800, "height": 600}
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
+            
+            print("Membuka Google Search...")
+            await page.goto("https://www.google.co.id/search?q=wdbos", wait_until="domcontentloaded")
+            
+            print("\n=======================================================")
+            print(" PETUNJUK:")
+            print(" 1. Selesaikan centang CAPTCHA (Saya Bukan Robot) di browser.")
+            print(" 2. Setelah hasil pencarian Google muncul, tutup jendela")
+            print("    browser atau tekan Ctrl+C di terminal ini.")
+            print("=======================================================\n")
+            
+            # Keep browser open until closed or interrupted
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\nMenutup browser dan menyimpan sesi...")
+        except Exception as e:
+            print(f"\nSesi ditutup: {e}")
+        finally:
+            try:
+                await context.close()
+            except:
+                pass
+            print("Sesi berhasil disimpan! Sekarang Anda bisa menjalankan 'python rank.py' kembali.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nSelesai.")
