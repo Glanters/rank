@@ -667,7 +667,7 @@ def save_keywords_data(data):
         print(f"[Error] Gagal menulis ke {KEYWORDS_FILE}: {e}")
 
 async def cron_job(application):
-    print("[Cron] Penjadwal pengecekan otomatis berkala (30 menit) aktif (mode antrean 1-per-1 per user).")
+    print("[Cron] Penjadwal pengecekan otomatis berkala (30 menit) aktif (memindai SEMUA kata kunci setiap interval).")
     while True:
         # Tunggu 30 menit (1800 detik)
         await asyncio.sleep(1800)
@@ -679,9 +679,8 @@ async def cron_job(application):
             print("[Cron] Pengecekan otomatis dilewati: tidak ada user terdaftar.")
             continue
             
-        print("[Cron] Memulai pengecekan berkala...")
+        print("[Cron] Memulai pengecekan berkala untuk semua kata kunci...")
         
-        # Jalankan pengecekan untuk masing-masing user secara bergiliran 1 kata kunci
         for chat_id_str, user_data in list(users_dict.items()):
             try:
                 chat_id = int(chat_id_str)
@@ -692,33 +691,26 @@ async def cron_job(application):
             if not keywords:
                 continue
                 
-            next_index = user_data.get("next_index", 0)
-            
-            if next_index >= len(keywords):
-                next_index = 0
+            print(f"[Cron] User {chat_id}: Memindai {len(keywords)} kata kunci...")
+            for i, kw in enumerate(keywords):
+                print(f"[Cron] User {chat_id}: Memindai ({i+1}/{len(keywords)}): {kw}")
+                results, source = await get_top5(kw)
+                if results:
+                    msg = build_cyberpunk_message(kw, results, source)
+                    try:
+                        await application.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True
+                        )
+                    except Exception as ex:
+                        print(f"[Cron] Gagal mengirim pesan ke user {chat_id} untuk {kw}: {ex}")
+                else:
+                    print(f"[Cron] Gagal memindai {kw} pada pengecekan otomatis berkala.")
                 
-            kw = keywords[next_index]
-            print(f"[Cron] User {chat_id}: Memindai kata kunci ke-{next_index + 1}: {kw}")
-            
-            results, source = await get_top5(kw)
-            if results:
-                msg = build_cyberpunk_message(kw, results, source)
-                try:
-                    await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                except Exception as ex:
-                    print(f"[Cron] Gagal mengirim pesan ke user {chat_id} untuk {kw}: {ex}")
-            else:
-                print(f"[Cron] Gagal memindai {kw} pada pengecekan otomatis berkala.")
-                
-            # Update index untuk pemindaian user ini berikutnya
-            user_data["next_index"] = (next_index + 1) % len(keywords)
-            
-        save_keywords_data(data)
+                # Jeda 3-6 detik antar kata kunci agar aman dari rate limit
+                await asyncio.sleep(random.uniform(3.0, 6.0))
 
 async def post_init(application):
     global _bot_app_ref
