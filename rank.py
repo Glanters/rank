@@ -1,16 +1,24 @@
 import sys
 import os
+import json
+import re
 import html
 import asyncio
 import random
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 import requests
+# pyrefly: ignore [missing-import]
 from bs4 import BeautifulSoup
+# pyrefly: ignore [missing-import]
 from ddgs import DDGS
+# pyrefly: ignore [missing-import]
 from telegram import Update
+# pyrefly: ignore [missing-import]
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+# pyrefly: ignore [missing-import]
 from playwright.async_api import async_playwright
+# pyrefly: ignore [missing-import]
 from playwright_stealth import Stealth
 
 # Configure standard output to use UTF-8 to support emoji/special characters in Windows terminals
@@ -166,6 +174,120 @@ def clean_google_title(a_element, url, domain):
     return text if text else "Tanpa Judul"
 
 
+def is_url_amp_format(url):
+    try:
+        url_lower = url.lower()
+        parsed = urlparse(url_lower)
+        path = parsed.path
+        query = parsed.query
+        netloc = parsed.netloc
+        
+        # 1. Subdomain 'amp.' atau segmen path '/amp/', '/amp', '.amp'
+        if netloc.startswith("amp.") or "/amp/" in path or path.endswith("/amp") or path.endswith(".amp"):
+            return True
+        # 2. Query param seperti ?amp, ?amp=1, ?format=amp, atau &amp
+        if "amp=" in query or query == "amp" or "&amp" in query or "format=amp" in query:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_indonesian_block_page(url, original_domain):
+    try:
+        url_lower = url.lower()
+        parsed = urlparse(url_lower)
+        netloc = parsed.netloc
+        path = parsed.path
+        
+        # 1. Kata kunci standar internet positif
+        standard_block_keywords = [
+            "internetpositif", "internet-positif", "mercusuar", 
+            "trustpositif", "trust-positif", "nawala", "menkominfo"
+        ]
+        for kw in standard_block_keywords:
+            if kw in url_lower:
+                return True
+                
+        # 2. Deteksi decoy page Telkomsel / Indihome (.web.id)
+        original_domain_lower = original_domain.lower().replace("www.", "")
+        final_domain_lower = netloc.replace("www.", "")
+        
+        if final_domain_lower != original_domain_lower:
+            # Jika dialihkan ke domain .web.id
+            if final_domain_lower.endswith(".web.id"):
+                decoy_patterns = ["parfum", "sehat", "kerja", "lagu", "puisi", "rakyat", "sejarah", "kuliner", "wisata", "tebak", "baca", "info", "artikel"]
+                for pat in decoy_patterns:
+                    if pat in final_domain_lower or pat in path:
+                        return True
+        return False
+    except Exception:
+        return False
+
+
+def check_url_online_sync(url):
+    # Cek format URL di awal secara lokal (instan)
+    is_amp = is_url_amp_format(url)
+    original_domain = get_domain(url)
+    linked_domain = None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        with requests.get(url, headers=headers, timeout=4.0, stream=True, allow_redirects=True) as res:
+            if res.status_code >= 400:
+                return False, is_amp, res.url, linked_domain
+                
+            final_url = res.url
+            # Deteksi pemblokiran ISP Indonesia
+            if is_indonesian_block_page(final_url, original_domain):
+                return False, False, final_url, linked_domain
+                
+            final_url_lower = final_url.lower()
+            # Cek ulang format URL di url tujuan akhir (jika ada pengalihan)
+            if is_url_amp_format(final_url_lower):
+                is_amp = True
+                
+            # Baca hingga 100KB pertama teks konten HTML
+            html_chunk = ""
+            for chunk in res.iter_content(chunk_size=4096, decode_unicode=True):
+                if chunk:
+                    html_chunk += chunk
+                if len(html_chunk) > 100000:
+                    break
+                    
+            html_lower = html_chunk.lower()
+            
+            is_amp_itself = bool(re.search(r'<html[^>]*\s(amp|⚡|\u26a1)[>\s]', html_lower))
+            has_amp_link = "amphtml" in html_lower or "rel=\"amphtml\"" in html_lower or "rel='amphtml'" in html_lower
+            
+            if is_amp_itself or has_amp_link:
+                is_amp = True
+            
+            # Ekstrak semua href link eksternal dari halaman (tombol login/daftar/join)
+            # Gunakan original html_chunk (case-preserved) untuk ekstrak URL
+            hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_chunk, re.I)
+            orig_dom_clean = original_domain.lower().replace("www.", "")
+            for href in hrefs:
+                if not href.startswith("http"):
+                    continue
+                href_domain = get_domain(href).lower().replace("www.", "")
+                # Ambil domain eksternal (bukan domain yang sedang di-scan itu sendiri)
+                if href_domain and href_domain != orig_dom_clean and len(href_domain) > 3:
+                    linked_domain = href_domain
+                    break
+                
+            return True, is_amp, final_url, linked_domain
+    except Exception:
+        # Jika gagal request tetapi format URL secara fisik mengandung AMP, tetap laporkan is_amp = True
+        return False, is_amp, url, linked_domain
+
+
+async def check_url_online_async(url):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, check_url_online_sync, url)
+
+
 def get_normalized_proxies():
     """Menormalisasi PROXY agar kompatibel dengan requests (dict) dan ddgs (string)."""
     if not PROXY:
@@ -284,6 +406,22 @@ async def get_top5(keyword):
                         
             if len(top5) >= 3:
                 print(f"[Success] Berhasil mengambil {len(top5)} link secara langsung dari Google pada percobaan {attempt}.")
+                # Cek status online secara paralel
+                status_tasks = [check_url_online_async(r["url"]) for r in top5]
+                statuses = await asyncio.gather(*status_tasks)
+                for r, status in zip(top5, statuses):
+                    if isinstance(status, tuple) and len(status) == 4:
+                        is_online, is_amp, final_url, linked_domain = status
+                    elif isinstance(status, tuple) and len(status) == 3:
+                        is_online, is_amp, final_url = status
+                        linked_domain = None
+                    else:
+                        is_online, is_amp, final_url, linked_domain = status, False, r["url"], None
+                    r["is_online"] = is_online
+                    r["is_amp"] = is_amp or (r.get("type") == "amp")
+                    r["final_url"] = final_url if final_url else r["url"]
+                    r["final_domain"] = get_domain(r["final_url"])
+                    r["linked_domain"] = linked_domain or ""
                 return top5, "Google"
             else:
                 print(f"[INFO] Percobaan {attempt}: Jumlah link hasil pencarian langsung kurang ({len(top5)}) atau terblokir.")
@@ -311,6 +449,22 @@ async def get_top5(keyword):
             })
             if len(top5) >= 5:
                 break
+        # Cek status online secara paralel untuk fallback
+        status_tasks = [check_url_online_async(r["url"]) for r in top5]
+        statuses = await asyncio.gather(*status_tasks)
+        for r, status in zip(top5, statuses):
+            if isinstance(status, tuple) and len(status) == 4:
+                is_online, is_amp, final_url, linked_domain = status
+            elif isinstance(status, tuple) and len(status) == 3:
+                is_online, is_amp, final_url = status
+                linked_domain = None
+            else:
+                is_online, is_amp, final_url, linked_domain = status, False, r["url"], None
+            r["is_online"] = is_online
+            r["is_amp"] = is_amp or (r.get("type") == "amp")
+            r["final_url"] = final_url if final_url else r["url"]
+            r["final_domain"] = get_domain(r["final_url"])
+            r["linked_domain"] = linked_domain or ""
         return top5, "Bing/Brave/DDG"
     except Exception as e:
         print(f"[Error] Fallback metasearch juga gagal: {e}")
@@ -323,60 +477,325 @@ def _signal_bar(ctr, width=10, cap=28):
 
 
 def build_cyberpunk_message(keyword, results, source):
-    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-    
-    # Emas, perak, perunggu, dan biru untuk visualisasi rank
-    rank_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "🔹", 5: "🔹"}
-    
+    # Tampilan respon sederhana, bersih, dan sesuai dengan screenshot dari user
     lines = [
-        "🤖 <b>JEMBUT SCANNER</b>",
-        "⚡ <i>Stay in the Grid · Realtime Status</i>",
-        "──────────────────────────────",
-        f"🎯 <b>Target  :</b> <code>{html.escape(keyword)}</code>",
-        f"📡 <b>Source  :</b> <code>{source if source else 'N/A'}</code>",
-        f"📅 <b>Stamp   :</b> <code>{now}</code>",
-        f"🔋 <b>Nodes   :</b> <code>{len(results)}/5 locked</code>",
-        "──────────────────────────────",
+        f"🎯 <b>RANK CHECKER | {keyword.upper()}</b>",
+        "──────────────────────",
+        f"Search Results: Found {len(results)}",
         ""
     ]
 
+    kw_clean = keyword.lower().replace(" ", "")
+
     for i, r in enumerate(results):
         pos = i + 1
-        ctr = CTR.get(pos, 5)
-        tag = TAG.get(r["type"], "[REG]")
-        sig = _signal_bar(ctr)
-        title = html.escape(r["title"][:50]) # Mengizinkan judul lebih panjang
         url = html.escape(r["url"], quote=True)
-        domain = html.escape(r["domain"][:30])
+        domain = html.escape(r["domain"])
         
-        emoji = rank_emojis.get(pos, "🔹")
+        # 1. Emoji 1: ⚠️ (static warning)
+        # 2. Emoji 2: ⚡ (AMP) atau ✖ (Non-AMP)
+        amp_emoji = "⚡" if r.get("is_amp") else "✖"
         
-        lines.append(f"{emoji} <b>RANK {pos:02d}</b>  ·  <code>{tag}</code>")
-        lines.append(f"   <code>{sig}  {ctr}% est.CTR</code>")
-        lines.append(f"   🔗 <a href=\"{url}\"><b>{title}</b></a>")
-        lines.append(f"   🌐 <i>{domain}</i>")
+        # Dapatkan domain tujuan akhir (redirect) jika ada
+        final_domain = html.escape(r.get("final_domain", r["domain"]))
+        final_url = html.escape(r.get("final_url", r["url"]), quote=True)
         
-        if pos < len(results):
-            lines.append("──────────────────────────────")
+        orig_dom_clean = domain.lower().replace("www.", "")
+        final_dom_clean = final_domain.lower().replace("www.", "")
+        linked_domain_clean = r.get("linked_domain", "").lower().replace("www.", "")
+        
+        # Cek kepemilikan: keyword brand harus muncul di domain tujuan redirect
+        # ATAU di link tombol login/daftar di halaman tersebut
+        is_ours = (kw_clean in final_dom_clean) or (linked_domain_clean and kw_clean in linked_domain_clean)
+        
+        # 3. Emoji 3: ⭐ jika milik sendiri, 🔴 jika milik kompetitor/luar
+        circle_emoji = "⭐" if is_ours else "🔴"
+        
+        # 4. Emoji 4: ✅ (Online/Unblocked) atau ❌ (Offline/Blocked)
+        status_emoji = "✅" if r.get("is_online", True) else "❌"
+        
+        if orig_dom_clean == final_dom_clean:
+            domain_display = f"<a href=\"{url}\">{domain}</a>"
+        else:
+            domain_display = f"<a href=\"{url}\">{domain}</a> ➔ <a href=\"{final_url}\">{final_domain}</a>"
+        
+        lines.append(f"{pos}. ⚠️{amp_emoji}{circle_emoji}{status_emoji} {domain_display}")
 
-    lines += [
-        "",
-        "💾 <b>Scan complete · System online</b>",
-        "──────────────────────────────"
-    ]
     return "\n".join(lines)
 
 
+KEYWORDS_FILE = "keywords.json"
+
+def load_keywords_data():
+    default_structure = {"users": {}}
+    if not os.path.exists(KEYWORDS_FILE):
+        return default_structure
+    try:
+        with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+            # Migrasi data format lama (single user) ke format baru (multi-user)
+            if "users" not in data:
+                print("[Migration] Mendeteksi database format lama. Melakukan migrasi ke format multi-user...")
+                chat_id = data.get("chat_id")
+                keywords = data.get("keywords", [])
+                next_index = data.get("next_index", 0)
+                
+                data = {"users": {}}
+                if chat_id and keywords:
+                    data["users"][str(chat_id)] = {
+                        "keywords": keywords,
+                        "next_index": next_index
+                    }
+            
+            # Self-healing database untuk masing-masing user dari kata kunci gabungan
+            changed = False
+            for user_id_str, user_data in data.get("users", {}).items():
+                keywords = user_data.get("keywords", [])
+                cleaned_keywords = []
+                user_changed = False
+                for kw in keywords:
+                    if len(kw) > 50 and (" " in kw or "\n" in kw or "\r" in kw):
+                        normalized = kw.replace("\n", " ").replace("\r", " ").replace(",", " ")
+                        parts = [p.strip() for p in normalized.split(" ") if p.strip()]
+                        cleaned_keywords.extend(parts)
+                        user_changed = True
+                        changed = True
+                    else:
+                        cleaned_keywords.append(kw)
+                if user_changed:
+                    user_data["keywords"] = cleaned_keywords
+                    
+            if changed or "users" not in data or not os.path.exists(KEYWORDS_FILE):
+                try:
+                    with open(KEYWORDS_FILE, "w", encoding="utf-8") as f_out:
+                        json.dump(data, f_out, indent=4, ensure_ascii=False)
+                    print("[Self-Healing] Database berhasil dirapikan otomatis dari kata kunci gabungan.")
+                except Exception as ex:
+                    print(f"[Warning] Gagal menyimpan database hasil self-healing: {ex}")
+                    
+            return data
+    except Exception as e:
+        print(f"[Error] Gagal membaca {KEYWORDS_FILE}: {e}")
+        return default_structure
+
+def save_keywords_data(data):
+    try:
+        with open(KEYWORDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"[Error] Gagal menulis ke {KEYWORDS_FILE}: {e}")
+
+async def cron_job(application):
+    print("[Cron] Penjadwal pengecekan otomatis berkala (30 menit) aktif (mode antrean 1-per-1 per user).")
+    while True:
+        # Tunggu 30 menit (1800 detik)
+        await asyncio.sleep(1800)
+        
+        data = load_keywords_data()
+        users_dict = data.get("users", {})
+        
+        if not users_dict:
+            print("[Cron] Pengecekan otomatis dilewati: tidak ada user terdaftar.")
+            continue
+            
+        print("[Cron] Memulai pengecekan berkala...")
+        
+        # Jalankan pengecekan untuk masing-masing user secara bergiliran 1 kata kunci
+        for chat_id_str, user_data in list(users_dict.items()):
+            try:
+                chat_id = int(chat_id_str)
+            except ValueError:
+                continue
+                
+            keywords = user_data.get("keywords", [])
+            if not keywords:
+                continue
+                
+            next_index = user_data.get("next_index", 0)
+            
+            if next_index >= len(keywords):
+                next_index = 0
+                
+            kw = keywords[next_index]
+            print(f"[Cron] User {chat_id}: Memindai kata kunci ke-{next_index + 1}: {kw}")
+            
+            results, source = await get_top5(kw)
+            if results:
+                msg = build_cyberpunk_message(kw, results, source)
+                try:
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                except Exception as ex:
+                    print(f"[Cron] Gagal mengirim pesan ke user {chat_id} untuk {kw}: {ex}")
+            else:
+                print(f"[Cron] Gagal memindai {kw} pada pengecekan otomatis berkala.")
+                
+            # Update index untuk pemindaian user ini berikutnya
+            user_data["next_index"] = (next_index + 1) % len(keywords)
+            
+        save_keywords_data(data)
+
+async def post_init(application):
+    asyncio.create_task(cron_job(application))
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "<pre>▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓\n"
-        " JEMBUT RANK — ONLINE\n"
-        "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓</pre>\n"
-        "Kirim keyword untuk memindai Top 5 SERP.\n"
-        "Contoh: <code>wdbos</code>",
+        "🤖 <b>JEMBUT SCANNER — ONLINE</b>\n"
+        "──────────────────────────────\n"
+        "Kirim keyword untuk memindai Top 5 SERP secara instan.\n\n"
+        "<b>Perintah Otomatis (30 Menit):</b>\n"
+        "• <code>/add [keyword]</code> - Tambahkan keyword (bisa multi-line)\n"
+        "• <code>/del [keyword]</code> - Hapus keyword (bisa multi-line)\n"
+        "• <code>/list</code> - Tampilkan semua keyword terpantau Anda\n"
+        "• <code>/clear</code> - Kosongkan semua daftar keyword terpantau Anda\n"
+        "• <code>/scan</code> - Jalankan semua pemantau instan sekarang",
         parse_mode="HTML"
     )
 
+async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = update.message.text
+    words = raw_text.split(None, 1)
+    if len(words) < 2:
+        return await update.message.reply_text("⚠️ Format salah. Contoh:\n<code>/add depobos</code>\n\natau tulis multi-line:\n<code>/add\ndepobos\nwdbos</code>", parse_mode="HTML")
+        
+    remaining = words[1].strip()
+    
+    # Deteksi jika ada baris baru (multi-line paste)
+    if "\n" in remaining:
+        candidates = [line.strip() for line in remaining.split("\n") if line.strip()]
+    else:
+        candidates = [remaining]
+        
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    
+    # Inisialisasi user jika belum ada di database
+    if chat_id not in data["users"]:
+        data["users"][chat_id] = {"keywords": [], "next_index": 0}
+        
+    user_keywords = data["users"][chat_id]["keywords"]
+    
+    added = []
+    already_exists = []
+    
+    for kw in candidates:
+        if kw.lower() in [k.lower() for k in user_keywords]:
+            already_exists.append(kw)
+        else:
+            user_keywords.append(kw)
+            added.append(kw)
+            
+    if added:
+        save_keywords_data(data)
+        
+    msg_parts = []
+    if added:
+        msg_parts.append(f"✅ <b>Berhasil memantau {len(added)} keyword baru:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in added]))
+    if already_exists:
+        msg_parts.append(f"ℹ️ <b>{len(already_exists)} keyword sudah ada dalam pemantau Anda:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in already_exists]))
+        
+    await update.message.reply_text("\n\n".join(msg_parts), parse_mode="HTML")
+
+async def del_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = update.message.text
+    words = raw_text.split(None, 1)
+    if len(words) < 2:
+        return await update.message.reply_text("⚠️ Format salah. Contoh:\n<code>/del depobos</code>\n\natau tulis multi-line:\n<code>/del\ndepobos\nwdbos</code>", parse_mode="HTML")
+        
+    remaining = words[1].strip()
+    
+    # Deteksi jika ada baris baru
+    if "\n" in remaining:
+        candidates = [line.strip() for line in remaining.split("\n") if line.strip()]
+    else:
+        candidates = [remaining]
+        
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id not in data["users"] or not data["users"][chat_id]["keywords"]:
+        return await update.message.reply_text("📭 Daftar keyword Anda kosong.", parse_mode="HTML")
+        
+    user_keywords = data["users"][chat_id]["keywords"]
+    
+    removed = []
+    not_found = []
+    
+    for kw in candidates:
+        found = None
+        for k in user_keywords:
+            if k.lower() == kw.lower():
+                found = k
+                break
+        if found:
+            user_keywords.remove(found)
+            removed.append(found)
+        else:
+            not_found.append(kw)
+            
+    if removed:
+        # Reset next_index jika out of bounds akibat penghapusan
+        if data["users"][chat_id]["next_index"] >= len(user_keywords):
+            data["users"][chat_id]["next_index"] = 0
+        save_keywords_data(data)
+        
+    msg_parts = []
+    if removed:
+        msg_parts.append(f"🗑️ <b>Berhasil menghapus {len(removed)} keyword Anda:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in removed]))
+    if not_found:
+        msg_parts.append(f"❌ <b>{len(not_found)} keyword tidak ditemukan:</b>\n" + "\n".join([f"- <code>{html.escape(k)}</code>" for k in not_found]))
+        
+    await update.message.reply_text("\n\n".join(msg_parts), parse_mode="HTML")
+
+async def clear_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    if chat_id in data["users"]:
+        data["users"][chat_id]["keywords"] = []
+        data["users"][chat_id]["next_index"] = 0
+        save_keywords_data(data)
+    await update.message.reply_text("🧹 <b>Daftar keyword Anda berhasil dikosongkan!</b>", parse_mode="HTML")
+
+async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    keywords = []
+    if chat_id in data["users"]:
+        keywords = data["users"][chat_id].get("keywords", [])
+        
+    if not keywords:
+        return await update.message.reply_text("📭 Daftar keyword Anda kosong. Tambahkan dengan <code>/add [keyword]</code>.", parse_mode="HTML")
+        
+    msg = "📋 <b>Daftar Keyword Terpantau Anda (30 Menit):</b>\n\n"
+    for i, kw in enumerate(keywords):
+        msg += f"{i+1}. <code>{html.escape(kw)}</code>\n"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def scan_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_keywords_data()
+    chat_id = str(update.effective_chat.id)
+    keywords = []
+    if chat_id in data["users"]:
+        keywords = data["users"][chat_id].get("keywords", [])
+        
+    if not keywords:
+        return await update.message.reply_text("📭 Daftar keyword Anda kosong.", parse_mode="HTML")
+        
+    await update.message.reply_text(f"🚀 Memulai pemindaian instan untuk {len(keywords)} keyword Anda...", parse_mode="HTML")
+    
+    for kw in keywords:
+        results, source = await get_top5(kw)
+        if results:
+            msg = build_cyberpunk_message(kw, results, source)
+            await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await update.message.reply_text(f"❌ Gagal memindai keyword: <code>{html.escape(kw)}</code>", parse_mode="HTML")
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
 async def cek_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyword = update.message.text.strip()
@@ -402,8 +821,13 @@ async def cek_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_keyword))
+    app.add_handler(CommandHandler("del", del_keyword))
+    app.add_handler(CommandHandler("clear", clear_keywords))
+    app.add_handler(CommandHandler("list", list_keywords))
+    app.add_handler(CommandHandler("scan", scan_all))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cek_keyword))
     print("Cyberpunk bot online…")
     app.run_polling()
