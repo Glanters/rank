@@ -7,7 +7,6 @@
     "solve": "node solve_puppeteer.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.0.0",
     "puppeteer": "^22.0.0"
   }
 }

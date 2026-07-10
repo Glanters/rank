@@ -29,7 +29,8 @@ const rl = readline.createInterface({
 const askQuestion = (query) => new Promise((resolve) => rl.question(query, resolve));
 
 async function main() {
-    const proxyUrl = getProxyFromRankPy();
+    const disableProxy = process.argv.includes('--no-proxy') || process.argv.includes('--direct');
+    const proxyUrl = disableProxy ? null : getProxyFromRankPy();
     const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -52,7 +53,7 @@ async function main() {
             console.error("Gagal parse proxy URL:", err.message);
         }
     } else {
-        console.log("Berjalan tanpa proxy.");
+        console.log(disableProxy ? "Berjalan tanpa proxy (Mode Direct)." : "Berjalan tanpa proxy (Tidak terkonfigurasi di rank.py).");
     }
 
     console.log("Membuka browser Chromium via Puppeteer...");
