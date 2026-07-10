@@ -561,8 +561,8 @@ def build_cyberpunk_message(keyword, results, source):
     # Tampilan respon sederhana, bersih, dan sesuai dengan screenshot dari user
     lines = [
         f"🎯 <b>RANK CHECKER | {keyword.upper()}</b>",
+        f"📡 <b>Source:</b> {source}",
         "──────────────────────",
-        f"Search Results: Found {len(results)}",
         ""
     ]
 
