@@ -86,19 +86,26 @@ EXEMPTION_REFRESH_MIN = 25
 _captcha_notified = False
 _bot_app_ref = None   # Referensi global ke aplikasi bot
 _web_solver = None    # Instance CaptchaWebSolver (Mini App)
+_web_runner = None    # aiohttp AppRunner (untuk shutdown)
+_web_server_ok = False  # True hanya jika server relay berhasil listen
 _web_solve_active = False  # Sedang ada sesi solve web berjalan
 _web_solve_started_at = 0.0  # Waktu mulai sesi solve (untuk timeout)
+_web_last_fail_at = 0.0      # Waktu percobaan solve terakhir GAGAL (cooldown)
 WEB_SOLVE_TIMEOUT = 900      # Sesi solve dianggap basi setelah ini (detik)
+WEB_FAIL_COOLDOWN = 900      # Jeda sebelum coba lagi setelah gagal (hindari spam)
 CTR = {1: 28, 2: 15, 3: 11, 4: 8, 5: 7}
 TAG = {"amp": "[AMP]", "landing": "[LND]", "biasa": "[REG]"}
 BAR_W = 30
 
 
 def get_exemption_seconds_left():
-    """Sisa masa berlaku (detik) cookie GOOGLE_ABUSE_EXEMPTION valid, atau None."""
+    """Sisa masa berlaku (detik) cookie GOOGLE_ABUSE_EXEMPTION valid, atau None.
+
+    Sinkron (baca file/DB). Dari konteks async, pakai _exemption_seconds_left_async().
+    """
     try:
         best = None
-        for c in collect_google_cookies("./firefox_profile"):
+        for c in collect_google_cookies("./firefox_profile", verbose=False):
             if c.get("name") != "GOOGLE_ABUSE_EXEMPTION":
                 continue
             exp = c.get("expires")
@@ -116,8 +123,44 @@ def get_exemption_seconds_left():
         return None
 
 
+async def _exemption_seconds_left_async():
+    """Versi async: jalankan baca cookie yang blocking di thread pool agar tidak
+    memblokir event loop (yang juga melayani relay Mini App)."""
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, get_exemption_seconds_left)
+    except Exception:
+        return None
+
+
 def _web_captcha_configured():
+    """Konfigurasi valid (untuk memutuskan menjalankan server di post_init)."""
     return bool(CAPTCHA_WEB_ENABLED and PUBLIC_BASE_URL.startswith("https://"))
+
+
+def _web_captcha_ready():
+    """Siap menawarkan tombol Mini App: konfigurasi valid DAN server relay hidup."""
+    return _web_captcha_configured() and _web_server_ok
+
+
+def _web_solve_in_flight():
+    """True bila ada sesi solve yang masih aktif & belum melewati timeout."""
+    return _web_solve_active and (time.time() - _web_solve_started_at) < WEB_SOLVE_TIMEOUT
+
+
+async def _web_solve_watchdog(token):
+    """Setelah WEB_SOLVE_TIMEOUT, tutup sesi yang tak kunjung selesai agar tidak
+    membocorkan browser & tidak mengunci flag _web_solve_active selamanya."""
+    global _web_solve_active, _captcha_notified
+    await asyncio.sleep(WEB_SOLVE_TIMEOUT)
+    if _web_solver and _web_solver.token == token and _web_solver.state == "solving":
+        print("[CaptchaWeb] Sesi solve kedaluwarsa tanpa penyelesaian — dibersihkan.")
+        try:
+            await _web_solver.stop()
+        except Exception:
+            pass
+        _web_solve_active = False
+        _captcha_notified = False
 
 
 async def _on_web_solved():
@@ -126,7 +169,7 @@ async def _on_web_solved():
     _captcha_notified = False
     _web_solve_active = False
     if _bot_app_ref and ADMIN_CHAT_ID:
-        left = get_exemption_seconds_left()
+        left = await _exemption_seconds_left_async()
         info = f" (berlaku ~{int(left/60)} menit)" if left else ""
         try:
             await _bot_app_ref.bot.send_message(
@@ -141,11 +184,14 @@ async def _on_web_solved():
 
 async def trigger_web_captcha(reason="CAPTCHA terdeteksi"):
     """Buka sesi solve di VPS & kirim tombol Mini App ke admin."""
-    global _web_solver, _web_solve_active, _web_solve_started_at
-    if not _web_captcha_configured() or not _bot_app_ref or not ADMIN_CHAT_ID:
+    global _web_solver, _web_solve_active, _web_solve_started_at, _web_last_fail_at
+    if not _web_captcha_ready() or not _bot_app_ref or not ADMIN_CHAT_ID:
         return False
-    # Blokir hanya bila ada sesi yang MASIH baru (belum timeout); sesi basi di-reset.
-    if _web_solve_active and (time.time() - _web_solve_started_at) < WEB_SOLVE_TIMEOUT:
+    # Blokir bila ada sesi yang masih aktif (belum timeout)
+    if _web_solve_in_flight():
+        return False
+    # Cooldown setelah kegagalan agar tidak spam mencoba/mengabari terus-menerus
+    if _web_last_fail_at and (time.time() - _web_last_fail_at) < WEB_FAIL_COOLDOWN:
         return False
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -164,12 +210,15 @@ async def trigger_web_captcha(reason="CAPTCHA terdeteksi"):
         await _web_solver.start(token)
         if _web_solver.state == "error":
             _web_solve_active = False
+            _web_last_fail_at = time.time()
             await _bot_app_ref.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text="⚠️ Gagal membuka sesi solve di server. Coba lagi dengan /solveweb.",
+                text="⚠️ Gagal membuka sesi solve di server. Coba lagi nanti dengan /solveweb.",
             )
             return False
 
+        _web_last_fail_at = 0.0  # sukses membuka sesi -> reset cooldown
+        asyncio.create_task(_web_solve_watchdog(token))  # auto-bersihkan bila ditinggalkan
         url = f"{PUBLIC_BASE_URL}/solve?token={token}"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
             "🧩 Buka & Solve CAPTCHA di sini", web_app=WebAppInfo(url=url)
@@ -191,6 +240,7 @@ async def trigger_web_captcha(reason="CAPTCHA terdeteksi"):
         return True
     except Exception as e:
         _web_solve_active = False
+        _web_last_fail_at = time.time()
         print(f"[CaptchaWeb] trigger gagal: {e}")
         return False
 
@@ -201,8 +251,8 @@ async def notify_captcha_needed():
         return
     _captcha_notified = True
 
-    # Jika Mini App dikonfigurasi, pakai solve jarak jauh (cocok untuk VPS headless)
-    if _web_captcha_configured():
+    # Jika Mini App siap, pakai solve jarak jauh (cocok untuk VPS headless)
+    if _web_captcha_ready():
         ok = await trigger_web_captcha("Bot terkena CAPTCHA saat mengambil hasil Google")
         if ok:
             return  # tombol Mini App sudah dikirim; tidak perlu notifikasi lama
@@ -554,7 +604,7 @@ def _sanitize_cookie(c):
     }
 
 
-def collect_google_cookies(profile_dir):
+def collect_google_cookies(profile_dir, verbose=True):
     """Ambil cookies Google terbaru secara otomatis setiap request.
 
     Menggabungkan cookies dari:
@@ -562,6 +612,8 @@ def collect_google_cookies(profile_dir):
     2. firefox_profile/cookies.sqlite (hasil solve.py — berisi GOOGLE_ABUSE_EXEMPTION)
        dimuat BELAKANGAN sehingga MENANG bila ada duplikat. Profil live lebih tepercaya
        daripada JSON yang bisa basi/tidak lengkap (mis. tanpa cookie exemption).
+
+    verbose=False menekan log (dipakai pemanggil berkala seperti monitor exemption).
     """
     merged = {}
 
@@ -580,7 +632,7 @@ def collect_google_cookies(profile_dir):
     try:
         from pathlib import Path
         from cookie_helper import get_google_cookies
-        for c in get_google_cookies(Path(profile_dir)):
+        for c in get_google_cookies(Path(profile_dir), verbose=verbose):
             cookie = _sanitize_cookie(c)
             if cookie["name"] and cookie["domain"]:
                 merged[(cookie["name"], cookie["domain"], cookie["path"])] = cookie
@@ -608,7 +660,8 @@ def collect_google_cookies(profile_dir):
                 clone = dict(valid_ex)
                 clone["domain"] = dom
                 merged[key] = clone
-        print("[Cookies] GOOGLE_ABUSE_EXEMPTION valid dicerminkan ke .google.com & .google.co.id")
+        if verbose:
+            print("[Cookies] GOOGLE_ABUSE_EXEMPTION valid dicerminkan ke .google.com & .google.co.id")
 
     return list(merged.values())
 
@@ -1152,17 +1205,18 @@ async def cron_job(application):
 
 async def exemption_monitor(application):
     """Pantau masa berlaku exemption; picu solve proaktif sebelum habis."""
-    if not _web_captcha_configured() or EXEMPTION_REFRESH_MIN <= 0:
+    if not _web_captcha_ready() or EXEMPTION_REFRESH_MIN <= 0:
         return
     print(f"[CaptchaWeb] Monitor exemption aktif (refresh proaktif < {EXEMPTION_REFRESH_MIN} menit).")
     while True:
         await asyncio.sleep(120)  # cek tiap 2 menit
         try:
-            left = get_exemption_seconds_left()
+            left = await _exemption_seconds_left_async()
             # Picu hanya bila: ada exemption yang MAU habis (bukan yang sudah tidak ada),
-            # tidak ada sesi solve berjalan, dan belum ada notifikasi tertunda.
+            # tidak ada sesi solve yang masih aktif, dan belum ada notifikasi tertunda.
+            # Pakai _web_solve_in_flight() (timeout-aware) agar konsisten dgn trigger.
             if left is not None and left < EXEMPTION_REFRESH_MIN * 60 \
-                    and not _web_solve_active and not _captcha_notified:
+                    and not _web_solve_in_flight() and not _captcha_notified:
                 print(f"[CaptchaWeb] Exemption sisa {int(left/60)} menit — memicu refresh proaktif.")
                 await trigger_web_captcha(
                     f"Exemption tinggal ~{int(left/60)} menit — perbarui agar tidak putus")
@@ -1171,7 +1225,7 @@ async def exemption_monitor(application):
 
 
 async def post_init(application):
-    global _bot_app_ref, _web_solver
+    global _bot_app_ref, _web_solver, _web_runner, _web_server_ok
     _bot_app_ref = application
     asyncio.create_task(cron_job(application))
 
@@ -1185,11 +1239,16 @@ async def post_init(application):
                 on_solved=_on_web_solved,
                 ua=get_stable_ua(),
             )
-            await captcha_web.start_server(_web_solver, CAPTCHA_WEB_PORT)
-            asyncio.create_task(exemption_monitor(application))
+            _web_runner = await captcha_web.start_server(_web_solver, CAPTCHA_WEB_PORT)
+            _web_server_ok = True
             print(f"[CaptchaWeb] Mini App siap. URL publik: {PUBLIC_BASE_URL}/solve")
         except Exception as e:
-            print(f"[CaptchaWeb] Gagal memulai server Mini App: {e}")
+            _web_server_ok = False
+            print(f"[CaptchaWeb] Gagal memulai server Mini App: {e}. "
+                  "Fitur Mini App DIMATIKAN (tombol tidak akan ditawarkan).")
+        # Monitor hanya dijalankan bila server benar-benar hidup
+        if _web_server_ok:
+            asyncio.create_task(exemption_monitor(application))
     elif CAPTCHA_WEB_ENABLED:
         print("[CaptchaWeb] Mini App dinonaktifkan: PUBLIC_BASE_URL belum diisi (harus https://...).")
 
@@ -1510,12 +1569,13 @@ async def solveweb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if ADMIN_CHAT_ID and int(chat_id) != ADMIN_CHAT_ID:
         return await update.message.reply_text("⛔ Perintah ini hanya untuk admin.")
-    if not _web_captcha_configured():
+    if not _web_captcha_ready():
         return await update.message.reply_text(
             "⚠️ Mini App belum aktif. Isi <code>PUBLIC_BASE_URL</code> (https://...) "
-            "di rank.py dan pastikan <code>CAPTCHA_WEB_ENABLED = True</code>.",
+            "di rank.py, pastikan <code>CAPTCHA_WEB_ENABLED = True</code>, dan server "
+            "relay berhasil berjalan (cek log saat start).",
             parse_mode="HTML")
-    left = get_exemption_seconds_left()
+    left = await _exemption_seconds_left_async()
     info = f"\nExemption saat ini sisa ~{int(left/60)} menit." if left else ""
     await update.message.reply_text(f"🧩 Membuka sesi solve CAPTCHA...{info}", parse_mode="HTML")
     ok = await trigger_web_captcha("Permintaan manual /solveweb")

@@ -28,12 +28,15 @@ def normalize_expiry(expiry_val):
     except (ValueError, TypeError):
         return expiry_val
 
-def get_google_cookies(profile_path: Path) -> List[Dict]:
+def get_google_cookies(profile_path: Path, verbose: bool = True) -> List[Dict]:
     """Read Google cookies from the cookies.sqlite database inside the given profile path.
 
     Firefox yang sedang berjalan MENGUNCI cookies.sqlite, sehingga membaca file itu
     langsung memicu 'database is locked'. Untuk itu DB (beserta -wal & -shm) disalin
     dulu ke lokasi sementara, baru dibaca dari salinan tsb.
+
+    verbose=False menekan log "Extracted N cookies" (dipakai oleh pemanggil berkala
+    seperti monitor exemption agar tidak spam).
     """
     db_path = profile_path / "cookies.sqlite"
     if not db_path.exists():
@@ -109,7 +112,8 @@ def get_google_cookies(profile_path: Path) -> List[Dict]:
                 "sameSite": ss
             })
             
-        print(f"[cookie_helper] Extracted {len(cookies)} Google cookies successfully.")
+        if verbose:
+            print(f"[cookie_helper] Extracted {len(cookies)} Google cookies successfully.")
     except Exception as e:
         print(f"[cookie_helper] Error reading cookies: {e}")
     finally:

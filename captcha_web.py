@@ -16,6 +16,7 @@ Telegram Mini App WAJIB HTTPS.
 """
 
 import os
+import secrets
 import asyncio
 
 from aiohttp import web
@@ -95,6 +96,7 @@ class CaptchaWebSolver:
         self._context = None
         self._page = None
         self._pw = None
+        self.token = None  # matikan token begitu sesi ditutup (tak bisa dipakai lagi)
 
     async def stop(self):
         async with self._lock:
@@ -141,31 +143,41 @@ class CaptchaWebSolver:
             pass
 
     async def check_solved(self):
-        """Periksa apakah CAPTCHA sudah lolos; jika ya, tangkap & simpan cookies."""
+        """Periksa apakah CAPTCHA sudah lolos; jika ya, tangkap & simpan cookies.
+
+        Diserialkan dengan _lock + cek ulang state/token setelah await agar dua
+        poll /solve/status yang tumpang-tindih tidak memicu on_solved()/simpan
+        cookies dua kali, dan agar poll basi tidak menutup sesi yang baru dimulai.
+        """
         if self.state in ("solved", "idle", "error"):
             return self.state
-        if not self._page or not self._context:
-            return self.state
-        try:
-            url = self._page.url or ""
-            cookies = await self._context.cookies()
-            has_ex = any(c.get("name") == "GOOGLE_ABUSE_EXEMPTION" for c in cookies)
-            if "sorry" not in url and has_ex:
-                self.state = "solved"
-                print("[CaptchaWeb] CAPTCHA lolos! Menangkap cookies exemption...")
-                if self.save_cookies_fn:
-                    try:
-                        self.save_cookies_fn(cookies)
-                    except Exception as e:
-                        print(f"[CaptchaWeb] gagal simpan cookies: {e}")
-                if self.on_solved:
-                    try:
-                        await self.on_solved()
-                    except Exception as e:
-                        print(f"[CaptchaWeb] on_solved error: {e}")
-                await self._cleanup()
-        except Exception as e:
-            print(f"[CaptchaWeb] check_solved error: {e}")
+        async with self._lock:
+            if self.state != "solving" or not self._page or not self._context:
+                return self.state
+            session_token = self.token
+            try:
+                url = self._page.url or ""
+                cookies = await self._context.cookies()
+                # Sesi bisa berganti/berhenti selama await -> pastikan masih sama
+                if self.state != "solving" or self.token != session_token:
+                    return self.state
+                has_ex = any(c.get("name") == "GOOGLE_ABUSE_EXEMPTION" for c in cookies)
+                if "sorry" not in url and has_ex:
+                    self.state = "solved"
+                    print("[CaptchaWeb] CAPTCHA lolos! Menangkap cookies exemption...")
+                    if self.save_cookies_fn:
+                        try:
+                            self.save_cookies_fn(cookies)
+                        except Exception as e:
+                            print(f"[CaptchaWeb] gagal simpan cookies: {e}")
+                    if self.on_solved:
+                        try:
+                            await self.on_solved()
+                        except Exception as e:
+                            print(f"[CaptchaWeb] on_solved error: {e}")
+                    await self._cleanup()
+            except Exception as e:
+                print(f"[CaptchaWeb] check_solved error: {e}")
         return self.state
 
 
@@ -173,8 +185,12 @@ class CaptchaWebSolver:
 
 def _check_token(request):
     solver = request.app["solver"]
-    tok = request.query.get("token") or (request.headers.get("X-Token"))
-    return solver.token is not None and tok == solver.token
+    # Klien mengirim token via header X-Token (tidak masuk access log); query
+    # ?token= hanya dipakai saat memuat halaman /solve pertama kali.
+    tok = request.headers.get("X-Token") or request.query.get("token")
+    if not solver.token or not tok:
+        return False
+    return secrets.compare_digest(str(tok), str(solver.token))
 
 
 async def _h_page(request):
@@ -193,10 +209,21 @@ async def _h_frame(request):
                         headers={"Cache-Control": "no-store"})
 
 
+async def _read_json_obj(request):
+    """Baca body JSON; kembalikan dict atau None (bukan crash 500 untuk input buruk)."""
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
 async def _h_tap(request):
     if not _check_token(request):
         return web.json_response({"ok": False}, status=403)
-    body = await request.json()
+    body = await _read_json_obj(request)
+    if body is None:
+        return web.json_response({"ok": False, "error": "bad json"}, status=400)
     await request.app["solver"].tap(body.get("fx", 0), body.get("fy", 0))
     return web.json_response({"ok": True})
 
@@ -204,7 +231,9 @@ async def _h_tap(request):
 async def _h_scroll(request):
     if not _check_token(request):
         return web.json_response({"ok": False}, status=403)
-    body = await request.json()
+    body = await _read_json_obj(request)
+    if body is None:
+        return web.json_response({"ok": False, "error": "bad json"}, status=400)
     await request.app["solver"].scroll(body.get("dy", 0))
     return web.json_response({"ok": True})
 
@@ -303,20 +332,30 @@ MINIAPP_HTML = r"""<!doctype html>
   var wrap = document.getElementById('wrap');
   var solved = false;
 
+  // Token dikirim via header X-Token agar tidak masuk access log reverse proxy
   function api(path, body){
-    return fetch(path + '?token=' + encodeURIComponent(token), {
+    var headers = {'X-Token': token};
+    if (body) headers['Content-Type'] = 'application/json';
+    return fetch(path, {
       method: body ? 'POST' : 'GET',
-      headers: body ? {'Content-Type':'application/json'} : {},
+      headers: headers,
       body: body ? JSON.stringify(body) : undefined
     });
   }
 
-  // Ambil frame terbaru
+  // Ambil frame terbaru (bebaskan blob URL sebelumnya agar tidak bocor memori)
+  var prevUrl = null;
   function pollFrame(){
     if (solved) return;
-    fetch('/solve/frame?token=' + encodeURIComponent(token) + '&t=' + Date.now())
-      .then(function(r){ if (r.status === 200) return r.blob(); return null; })
-      .then(function(b){ if (b) img.src = URL.createObjectURL(b); })
+    fetch('/solve/frame', { headers: {'X-Token': token} })
+      .then(function(r){ return r.status === 200 ? r.blob() : null; })
+      .then(function(b){
+        if (!b) return;
+        var u = URL.createObjectURL(b);
+        var old = prevUrl; prevUrl = u;
+        img.onload = function(){ if (old) URL.revokeObjectURL(old); };
+        img.src = u;
+      })
       .catch(function(){});
   }
 
