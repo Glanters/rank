@@ -40,8 +40,8 @@ REGION = "id-id"
 # Opsional: pakai proxy residensial biar backend Google lebih sering tembus.
 # Contoh: "socks5h://user:pass@host:port" atau "http://user:pass@host:port"
 PROXY = {
-    "http": "http://7LmoLRicjfmGcKj:XUdhrrU5YyGRG6r@178.93.21.231:48883",
-    "https": "http://7LmoLRicjfmGcKj:XUdhrrU5YyGRG6r@178.93.21.231:48883"
+    "http": "http://hjptuafv:orr000kh07hy@31.59.20.176:6754",
+    "https": "http://hjptuafv:orr000kh07hy@31.59.20.176:6754"
 }
 # =====================================================
 
