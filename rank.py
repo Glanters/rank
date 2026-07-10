@@ -386,7 +386,6 @@ async def get_top5(keyword):
         ua = random.choice(MOBILE_USER_AGENTS)
         
         playwright_proxy = None
-        # Gunakan proxy pada percobaan 1 & 2. Pada percobaan 3, coba langsung tanpa proxy
         if ddgs_proxy and attempt < 3:
             print(f"[Direct Search] Percobaan {attempt}/3 (Dengan Proxy): Menghubungi Google dengan perangkat: {ua}")
             try:
@@ -403,6 +402,14 @@ async def get_top5(keyword):
             proxy_log_type = "Tanpa Proxy (Penyelamat)" if ddgs_proxy else "Tanpa Proxy"
             print(f"[Direct Search] Percobaan {attempt}/3 ({proxy_log_type}): Menghubungi Google dengan perangkat: {ua}")
         
+        # Hapus file parent.lock jika ada sisa dari Windows/crash sebelumnya agar tidak crash di Linux/VPS
+        lock_file = os.path.join(profile_dir, "parent.lock")
+        if os.path.exists(lock_file):
+            try:
+                os.remove(lock_file)
+            except Exception as e:
+                print(f"[Warning] Gagal menghapus parent.lock sebelum launch: {e}")
+
         try:
             async with async_playwright() as p:
                 # Gunakan launch_persistent_context agar sesi cookies tersimpan dan bisa dipakai kembali
@@ -906,7 +913,7 @@ async def cek_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def solved_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin konfirmasi CAPTCHA sudah di-solve, bot reload cookies via solve.py."""
+    """Admin konfirmasi CAPTCHA sudah di-solve, bot reload status dan memverifikasi cookies."""
     global _captcha_notified
     chat_id = str(update.effective_chat.id)
     
@@ -915,47 +922,41 @@ async def solved_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⛔ Perintah ini hanya untuk admin.")
     
     await update.message.reply_text(
-        "🔄 <b>Menjalankan solve.py untuk reload cookies Google...</b>\n"
-        "<i>Mohon tunggu 20–30 detik.</i>",
+        "🔄 <b>Memproses pembaruan sesi cookies dari firefox_profile...</b>",
         parse_mode="HTML"
     )
     
-    try:
-        import subprocess
-        import sys as _sys
-        solve_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solve.py")
-        proc = await asyncio.create_subprocess_exec(
-            _sys.executable, solve_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        
-        if proc.returncode == 0:
-            _captcha_notified = False   # Reset flag agar notif bisa dikirim lagi nanti
-            await update.message.reply_text(
-                "✅ <b>Cookies berhasil diperbarui!</b>\n"
-                "Bot akan kembali normal pada pencarian berikutnya.",
-                parse_mode="HTML"
-            )
-        else:
-            err_msg = stderr.decode(errors='ignore')[:500] if stderr else "(tidak ada output)"
-            await update.message.reply_text(
-                f"⚠️ <b>solve.py selesai dengan error:</b>\n<pre>{html.escape(err_msg)}</pre>\n"
-                "Coba jalankan <code>python solve.py</code> manual di terminal.",
-                parse_mode="HTML"
-            )
-    except asyncio.TimeoutError:
-        await update.message.reply_text(
-            "⏱️ <b>solve.py timeout (>60 detik).</b>\n"
-            "Coba jalankan <code>python solve.py</code> manual di terminal.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ <b>Gagal menjalankan solve.py:</b> {html.escape(str(e))}",
-            parse_mode="HTML"
-        )
+    profile_dir = "./firefox_profile"
+    lock_file = os.path.join(profile_dir, "parent.lock")
+    
+    # Hapus file parent.lock jika tersisa dari windows agar tidak crash di Linux
+    removed_lock = False
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+            removed_lock = True
+        except Exception as e:
+            print(f"[Warning] Gagal menghapus parent.lock: {e}")
+            
+    # Hitung jumlah cookies google aktif
+    from pathlib import Path
+    from cookie_helper import get_google_cookies
+    
+    cookies = get_google_cookies(Path(profile_dir))
+    cookies_count = len(cookies)
+    
+    _captcha_notified = False  # Reset status notifikasi CAPTCHA
+    
+    status_msg = (
+        "✅ <b>Sesi CAPTCHA Berhasil Direset!</b>\n"
+        "──────────────────────────\n"
+        f"• Status Lock File: {'🗑️ Dihapus' if removed_lock else '✔️ Bersih (Tidak ada lock)'}\n"
+        f"• Jumlah Google Cookies Terdeteksi: <b>{cookies_count}</b>\n\n"
+        "Bot akan mencoba mengakses Google kembali pada pencarian berikutnya menggunakan profil baru yang Anda upload."
+    )
+    
+    await update.message.reply_text(status_msg, parse_mode="HTML")
+
 
 
 async def scan_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
