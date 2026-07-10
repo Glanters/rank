@@ -5,3 +5,4 @@ captcha.png
 *.log
 keywords.json
 google_cookies.json
+node_modules/
