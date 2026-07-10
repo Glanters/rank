@@ -1,0 +1,95 @@
+"""Utility to extract Google cookies from a Firefox profile.
+
+This helper opens the cookies.sqlite database inside the Firefox profile,
+extracts cookies matching Google domains, and returns them in a format
+compatible with Playwright's storage_state.
+"""
+
+import os
+import json
+import sqlite3
+from pathlib import Path
+from typing import List, Dict
+
+def normalize_expiry(expiry_val):
+    """Normalize the cookie expiry timestamp to seconds."""
+    if expiry_val is None:
+        return None
+    try:
+        val = float(expiry_val)
+        # If timestamp is in milliseconds (13 digits, > 10^11) or microseconds (16 digits)
+        if val > 10**11:
+            if val > 10**14:  # Microseconds
+                return val / 1000000.0
+            return val / 1000.0
+        return val
+    except (ValueError, TypeError):
+        return expiry_val
+
+def get_google_cookies(profile_path: Path) -> List[Dict]:
+    """Read Google cookies from the cookies.sqlite database inside the given profile path."""
+    db_path = profile_path / "cookies.sqlite"
+    if not db_path.exists():
+        print(f"[cookie_helper] No cookies.sqlite database found at: {db_path}")
+        return []
+        
+    cookies = []
+    # Open SQLite database in read-only mode using a URI
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        
+        # Check if table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='moz_cookies';")
+        if not cursor.fetchone():
+            print("[cookie_helper] moz_cookies table not found in database.")
+            conn.close()
+            return []
+            
+        # Select google-related cookies
+        query = """
+            SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite
+            FROM moz_cookies
+            WHERE host LIKE '%google.%'
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        for name, value, host, path, expiry, is_secure, is_http_only, same_site in rows:
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": host,
+                "path": path,
+                "expires": normalize_expiry(expiry),
+                "httpOnly": bool(is_http_only),
+                "secure": bool(is_secure),
+                "sameSite": "Lax" if same_site == 2 else ("Strict" if same_site == 3 else "None")
+            })
+            
+        conn.close()
+        print(f"[cookie_helper] Extracted {len(cookies)} Google cookies successfully.")
+    except Exception as e:
+        print(f"[cookie_helper] Error reading cookies: {e}")
+        
+    return cookies
+
+def generate_storage_state(profile_path: Path, output_file: Path) -> bool:
+    """Generate a Playwright storage state file containing Google cookies."""
+    cookies = get_google_cookies(profile_path)
+    if not cookies:
+        return False
+        
+    storage_state = {
+        "cookies": cookies,
+        "origins": []
+    }
+    
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(storage_state, f, indent=2, ensure_ascii=False)
+        print(f"[cookie_helper] Saved storage state to {output_file}")
+        return True
+    except Exception as e:
+        print(f"[cookie_helper] Failed to write storage state: {e}")
+        return False
