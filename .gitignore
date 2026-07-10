@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 firefox_profile/
 firefox_profile_direct/
+firefox_profile_solve/
 captcha.png
 *.log
 debug_last_attempt.html

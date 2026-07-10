@@ -79,6 +79,23 @@ function saveCookies(googleCookies) {
 }
 
 async function main() {
+    // Preflight: solve CAPTCHA butuh browser yang TERLIHAT, sedangkan VPS Linux
+    // biasanya tak punya layar (DISPLAY). Beri panduan, jangan crash mentah.
+    if (process.platform === 'linux' && !process.env.DISPLAY) {
+        console.error("\n❌ Tidak ada layar (DISPLAY tidak diset) — sepertinya ini VPS headless.");
+        console.error("   Menyelesaikan CAPTCHA butuh browser yang bisa DILIHAT & diklik.\n");
+        console.error("   PILIHAN:");
+        console.error("   A. Layar virtual + VNC (solve DARI VPS, exemption terikat IP VPS — yang benar):");
+        console.error("        sudo apt install -y xvfb x11vnc");
+        console.error("        xvfb-run -a --server-args=\"-screen 0 1280x800x24\" node solve_puppeteer.js");
+        console.error("      lalu di terminal lain jalankan x11vnc, sambungkan VNC dari PC Anda,");
+        console.error("      selesaikan CAPTCHA, baru tekan ENTER di terminal solver.");
+        console.error("   B. Andalkan fallback Bing/Brave/DDG (bot tetap jalan headless, tanpa solve).\n");
+        console.error("   ⚠️  PENTING: cookie exemption TERIKAT IP. Solve di PC rumah TIDAK berlaku");
+        console.error("      di IP VPS. Untuk Google-direct di VPS, solve harus DARI IP VPS (opsi A).");
+        process.exit(1);
+    }
+
     // Keputusan proxy: hormati USE_PROXY_FOR_GOOGLE di rank.py.
     //   --no-proxy / --direct  -> paksa tanpa proxy
     //   --proxy                -> paksa pakai proxy

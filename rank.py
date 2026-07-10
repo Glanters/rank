@@ -6,6 +6,7 @@ import html
 import asyncio
 import random
 import time
+import secrets
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 import requests
@@ -67,14 +68,131 @@ SCAN_DELAY_MAX = 30.0
 # Gunakan satu perangkat (User-Agent) yang KONSISTEN, bukan acak tiap request.
 # Merotasi perangkat pada profil cookies yang sama = sinyal bot yang kuat.
 STABLE_DEVICE = True
+
+# --- Solve CAPTCHA jarak jauh via Telegram Mini App (untuk VPS headless) ---
+# Saat CAPTCHA muncul, bot membuka sesi browser DI VPS lalu menyiarkan CAPTCHA-nya
+# ke Mini App; tap Anda dikirim balik ke browser VPS. Butuh URL HTTPS publik.
+CAPTCHA_WEB_ENABLED = True
+# Domain HTTPS Anda yang mengarah ke server ini (WAJIB https, tanpa slash di akhir).
+# Contoh: "https://rank.domainanda.com". Kosongkan ("") untuk menonaktifkan Mini App.
+PUBLIC_BASE_URL = "https://rank.smbabsen.site/"
+# Port lokal server relay (di belakang reverse proxy/HTTPS Anda).
+CAPTCHA_WEB_PORT = 8099
+# Perbarui exemption secara proaktif bila sisa masa berlaku < menit ini (0 = mati).
+EXEMPTION_REFRESH_MIN = 25
 # =====================================================
 
 # Flag global: apakah notifikasi CAPTCHA sudah dikirim (hindari spam)
 _captcha_notified = False
 _bot_app_ref = None   # Referensi global ke aplikasi bot
+_web_solver = None    # Instance CaptchaWebSolver (Mini App)
+_web_solve_active = False  # Sedang ada sesi solve web berjalan
+_web_solve_started_at = 0.0  # Waktu mulai sesi solve (untuk timeout)
+WEB_SOLVE_TIMEOUT = 900      # Sesi solve dianggap basi setelah ini (detik)
 CTR = {1: 28, 2: 15, 3: 11, 4: 8, 5: 7}
 TAG = {"amp": "[AMP]", "landing": "[LND]", "biasa": "[REG]"}
 BAR_W = 30
+
+
+def get_exemption_seconds_left():
+    """Sisa masa berlaku (detik) cookie GOOGLE_ABUSE_EXEMPTION valid, atau None."""
+    try:
+        best = None
+        for c in collect_google_cookies("./firefox_profile"):
+            if c.get("name") != "GOOGLE_ABUSE_EXEMPTION":
+                continue
+            exp = c.get("expires")
+            try:
+                exp = float(exp)
+            except (ValueError, TypeError):
+                continue
+            if exp < 0:
+                continue
+            left = exp - time.time()
+            if left > 0 and (best is None or left > best):
+                best = left
+        return best
+    except Exception:
+        return None
+
+
+def _web_captcha_configured():
+    return bool(CAPTCHA_WEB_ENABLED and PUBLIC_BASE_URL.startswith("https://"))
+
+
+async def _on_web_solved():
+    """Callback saat CAPTCHA di Mini App berhasil diselesaikan."""
+    global _captcha_notified, _web_solve_active
+    _captcha_notified = False
+    _web_solve_active = False
+    if _bot_app_ref and ADMIN_CHAT_ID:
+        left = get_exemption_seconds_left()
+        info = f" (berlaku ~{int(left/60)} menit)" if left else ""
+        try:
+            await _bot_app_ref.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"✅ <b>CAPTCHA selesai!</b> Cookies exemption diperbarui{info}. "
+                     "Bot lanjut memakai Google-direct.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+async def trigger_web_captcha(reason="CAPTCHA terdeteksi"):
+    """Buka sesi solve di VPS & kirim tombol Mini App ke admin."""
+    global _web_solver, _web_solve_active, _web_solve_started_at
+    if not _web_captcha_configured() or not _bot_app_ref or not ADMIN_CHAT_ID:
+        return False
+    # Blokir hanya bila ada sesi yang MASIH baru (belum timeout); sesi basi di-reset.
+    if _web_solve_active and (time.time() - _web_solve_started_at) < WEB_SOLVE_TIMEOUT:
+        return False
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+        import captcha_web
+
+        if _web_solver is None:
+            _web_solver = captcha_web.CaptchaWebSolver(
+                profile_dir="./firefox_profile",
+                save_cookies_fn=save_google_cookies,
+                on_solved=_on_web_solved,
+                ua=get_stable_ua(),
+            )
+        _web_solve_active = True
+        _web_solve_started_at = time.time()
+        token = secrets.token_urlsafe(16)
+        await _web_solver.start(token)
+        if _web_solver.state == "error":
+            _web_solve_active = False
+            await _bot_app_ref.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="⚠️ Gagal membuka sesi solve di server. Coba lagi dengan /solveweb.",
+            )
+            return False
+
+        url = f"{PUBLIC_BASE_URL}/solve?token={token}"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🧩 Buka & Solve CAPTCHA di sini", web_app=WebAppInfo(url=url)
+        )]])
+        await _bot_app_ref.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"🧩 <b>Solve CAPTCHA (Mini App)</b>\n"
+                "──────────────────────────\n"
+                f"{reason}.\n\n"
+                "Tekan tombol di bawah — CAPTCHA dari server VPS akan muncul. "
+                "Selesaikan (centang / pilih gambar / Verify), lalu cookies "
+                "otomatis diperbarui. Solve terjadi di IP VPS, jadi langsung berlaku."
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        print(f"[CaptchaWeb] Tombol Mini App dikirim ke admin ({reason}).")
+        return True
+    except Exception as e:
+        _web_solve_active = False
+        print(f"[CaptchaWeb] trigger gagal: {e}")
+        return False
 
 async def notify_captcha_needed():
     """Kirim notifikasi ke admin bahwa Google CAPTCHA perlu di-solve."""
@@ -82,6 +200,13 @@ async def notify_captcha_needed():
     if _captcha_notified or not ADMIN_CHAT_ID or not _bot_app_ref:
         return
     _captcha_notified = True
+
+    # Jika Mini App dikonfigurasi, pakai solve jarak jauh (cocok untuk VPS headless)
+    if _web_captcha_configured():
+        ok = await trigger_web_captcha("Bot terkena CAPTCHA saat mengambil hasil Google")
+        if ok:
+            return  # tombol Mini App sudah dikirim; tidak perlu notifikasi lama
+
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         keyboard = InlineKeyboardMarkup([
@@ -1025,10 +1150,48 @@ async def cron_job(application):
                 # Jeda antar kata kunci agar laju tidak seperti bot (kurangi CAPTCHA)
                 await asyncio.sleep(random.uniform(SCAN_DELAY_MIN, SCAN_DELAY_MAX))
 
+async def exemption_monitor(application):
+    """Pantau masa berlaku exemption; picu solve proaktif sebelum habis."""
+    if not _web_captcha_configured() or EXEMPTION_REFRESH_MIN <= 0:
+        return
+    print(f"[CaptchaWeb] Monitor exemption aktif (refresh proaktif < {EXEMPTION_REFRESH_MIN} menit).")
+    while True:
+        await asyncio.sleep(120)  # cek tiap 2 menit
+        try:
+            left = get_exemption_seconds_left()
+            # Picu hanya bila: ada exemption yang MAU habis (bukan yang sudah tidak ada),
+            # tidak ada sesi solve berjalan, dan belum ada notifikasi tertunda.
+            if left is not None and left < EXEMPTION_REFRESH_MIN * 60 \
+                    and not _web_solve_active and not _captcha_notified:
+                print(f"[CaptchaWeb] Exemption sisa {int(left/60)} menit — memicu refresh proaktif.")
+                await trigger_web_captcha(
+                    f"Exemption tinggal ~{int(left/60)} menit — perbarui agar tidak putus")
+        except Exception as e:
+            print(f"[CaptchaWeb] monitor error: {e}")
+
+
 async def post_init(application):
-    global _bot_app_ref
+    global _bot_app_ref, _web_solver
     _bot_app_ref = application
     asyncio.create_task(cron_job(application))
+
+    # Jalankan server relay Mini App + monitor exemption jika dikonfigurasi
+    if _web_captcha_configured():
+        try:
+            import captcha_web
+            _web_solver = captcha_web.CaptchaWebSolver(
+                profile_dir="./firefox_profile",
+                save_cookies_fn=save_google_cookies,
+                on_solved=_on_web_solved,
+                ua=get_stable_ua(),
+            )
+            await captcha_web.start_server(_web_solver, CAPTCHA_WEB_PORT)
+            asyncio.create_task(exemption_monitor(application))
+            print(f"[CaptchaWeb] Mini App siap. URL publik: {PUBLIC_BASE_URL}/solve")
+        except Exception as e:
+            print(f"[CaptchaWeb] Gagal memulai server Mini App: {e}")
+    elif CAPTCHA_WEB_ENABLED:
+        print("[CaptchaWeb] Mini App dinonaktifkan: PUBLIC_BASE_URL belum diisi (harus https://...).")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1342,6 +1505,25 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def solveweb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Picu manual sesi solve CAPTCHA via Mini App."""
+    chat_id = str(update.effective_chat.id)
+    if ADMIN_CHAT_ID and int(chat_id) != ADMIN_CHAT_ID:
+        return await update.message.reply_text("⛔ Perintah ini hanya untuk admin.")
+    if not _web_captcha_configured():
+        return await update.message.reply_text(
+            "⚠️ Mini App belum aktif. Isi <code>PUBLIC_BASE_URL</code> (https://...) "
+            "di rank.py dan pastikan <code>CAPTCHA_WEB_ENABLED = True</code>.",
+            parse_mode="HTML")
+    left = get_exemption_seconds_left()
+    info = f"\nExemption saat ini sisa ~{int(left/60)} menit." if left else ""
+    await update.message.reply_text(f"🧩 Membuka sesi solve CAPTCHA...{info}", parse_mode="HTML")
+    ok = await trigger_web_captcha("Permintaan manual /solveweb")
+    if not ok:
+        await update.message.reply_text(
+            "⚠️ Tidak bisa memulai sesi (mungkin sudah ada sesi berjalan). Coba lagi sebentar.")
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -1352,6 +1534,7 @@ def main():
     app.add_handler(CommandHandler("scan", scan_all))
     app.add_handler(CommandHandler("menu", scan_menu))
     app.add_handler(CommandHandler("solved", solved_captcha))
+    app.add_handler(CommandHandler("solveweb", solveweb_command))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^scan1:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cek_keyword))
     print("Cyberpunk bot online…")
