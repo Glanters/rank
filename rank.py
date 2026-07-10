@@ -5,6 +5,7 @@ import re
 import html
 import asyncio
 import random
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 import requests
@@ -25,7 +26,7 @@ from playwright_stealth import Stealth
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ==================== KONFIGURASI ====================
-TELEGRAM_TOKEN = "8360476610:AAEqBzP2fLUS84LO4gdfwIcolx8PEneD7KQ"
+TELEGRAM_TOKEN = "8804541161:AAGpcO1se7k9v_ImqZLQoTPjwIVAdKHMcA8"
 LOCATION = "Jakarta, Indonesia"
 TIMEZONE = timezone(timedelta(hours=7))   # GMT+7
 
@@ -40,9 +41,32 @@ REGION = "id-id"
 # Opsional: pakai proxy residensial biar backend Google lebih sering tembus.
 # Contoh: "socks5h://user:pass@host:port" atau "http://user:pass@host:port"
 PROXY = {
-    "http": "http://hjptuafv:orr000kh07hy@31.59.20.176:6754",
-    "https": "http://hjptuafv:orr000kh07hy@31.59.20.176:6754"
+    "http": "http://7LmoLRicjfmGcKj:XUdhrrU5YyGRG6r@178.93.21.231:48883",
+    "https": "http://7LmoLRicjfmGcKj:XUdhrrU5YyGRG6r@178.93.21.231:48883"
 }
+
+# Pakai proxy untuk pencarian Google via browser?
+# False = SEMUA percobaan Google lewat IP langsung (rumah) — direkomendasikan bila
+#         proxy Anda adalah datacenter (pasti diblokir Google / kena CAPTCHA 429).
+# True  = 2 percobaan pertama lewat proxy, percobaan ke-3 tanpa proxy.
+# Catatan: proxy TETAP dipakai untuk fallback metasearch (DDGS) apa pun nilainya.
+USE_PROXY_FOR_GOOGLE = False
+
+# Jalankan browser headless (tak terlihat) atau headed (terlihat)?
+# True  = headless — TAPI Google gampang mendeteksinya sebagai bot -> sering CAPTCHA.
+# False = headed (jendela browser muncul) — JAUH lebih jarang kena CAPTCHA.
+#         Cocok bila bot jalan di PC rumah yang punya layar. Di VPS tanpa layar,
+#         biarkan True (atau pakai xvfb).
+HEADLESS_BROWSER = True
+
+# Jeda (detik) antar-keyword saat scan. Makin lama makin kecil resiko CAPTCHA
+# karena laju pencarian tidak seperti bot. Dipakai di /scan & cron otomatis.
+SCAN_DELAY_MIN = 12.0
+SCAN_DELAY_MAX = 30.0
+
+# Gunakan satu perangkat (User-Agent) yang KONSISTEN, bukan acak tiap request.
+# Merotasi perangkat pada profil cookies yang sama = sinyal bot yang kuat.
+STABLE_DEVICE = True
 # =====================================================
 
 # Flag global: apakah notifikasi CAPTCHA sudah dikirim (hindari spam)
@@ -63,7 +87,7 @@ async def notify_captcha_needed():
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "🔗 Buka Google untuk Solve CAPTCHA",
-                url="https://www.google.co.id/search?q=test"
+                url="https://www.google.co.id/"
             )]
         ])
         await _bot_app_ref.bot.send_message(
@@ -73,9 +97,10 @@ async def notify_captcha_needed():
                 "──────────────────────────\n"
                 "Bot tidak bisa mengambil hasil Google karena terkena CAPTCHA.\n\n"
                 "<b>Cara solve:</b>\n"
-                "1. Klik tombol di bawah\n"
-                "2. Selesaikan CAPTCHA di browser yang terbuka\n"
-                "3. Ketik /solved di sini setelah selesai\n\n"
+                "1. Klik tombol di bawah (beranda Google)\n"
+                "2. Ketik pencarian apa saja secara manual\n"
+                "3. Selesaikan CAPTCHA yang muncul sampai hasil tampil normal\n"
+                "4. Ketik /solved di sini setelah selesai\n\n"
                 "<i>Bot akan otomatis reload cookies setelah /solved.</i>"
             ),
             parse_mode="HTML",
@@ -155,6 +180,36 @@ MOBILE_USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; Motorola Edge 40) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 13; ASUS_AI2205) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.90 Mobile Safari/537.36"   # ROG Phone 7
 ]
+
+DEVICE_UA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_ua.txt")
+
+def get_stable_ua():
+    """Kembalikan satu User-Agent yang KONSISTEN untuk profil ini.
+
+    Merotasi UA tiap request membuat Google melihat 1 profil (cookies sama)
+    memakai puluhan perangkat berbeda -> sinyal bot yang kuat & memicu CAPTCHA.
+    UA dipilih sekali lalu disimpan ke device_ua.txt agar identitas perangkat
+    tetap stabil. Hapus file itu untuk memilih ulang perangkat.
+    Jika STABLE_DEVICE=False, kembali ke perilaku acak lama.
+    """
+    if not STABLE_DEVICE:
+        return random.choice(MOBILE_USER_AGENTS)
+    try:
+        if os.path.exists(DEVICE_UA_FILE):
+            with open(DEVICE_UA_FILE, "r", encoding="utf-8") as f:
+                ua = f.read().strip()
+                if ua:
+                    return ua
+    except Exception:
+        pass
+    ua = random.choice(MOBILE_USER_AGENTS)
+    try:
+        with open(DEVICE_UA_FILE, "w", encoding="utf-8") as f:
+            f.write(ua)
+        print(f"[Device] Perangkat tetap dipilih untuk profil ini: {ua}")
+    except Exception:
+        pass
+    return ua
 
 
 def detect_link_type(url):
@@ -345,6 +400,115 @@ async def check_url_online_async(url):
     return await loop.run_in_executor(None, check_url_online_sync, url)
 
 
+COOKIES_JSON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_cookies.json")
+
+def _sanitize_cookie(c):
+    """Rapikan cookie agar selalu valid untuk Playwright add_cookies."""
+    expires = c.get("expires")
+    try:
+        expires = float(expires) if expires is not None else -1
+    except (ValueError, TypeError):
+        expires = -1
+    same_site = c.get("sameSite")
+    if same_site not in ("Strict", "Lax", "None"):
+        same_site = "Lax"
+    secure = bool(c.get("secure"))
+    # SameSite=None WAJIB Secure=True; kalau tidak, browser membuang cookie.
+    # Turunkan ke "Lax" agar cookie (mis. GOOGLE_ABUSE_EXEMPTION) tetap diterima.
+    if same_site == "None" and not secure:
+        same_site = "Lax"
+    return {
+        "name": c.get("name", ""),
+        "value": c.get("value", ""),
+        "domain": c.get("domain", ""),
+        "path": c.get("path", "/") or "/",
+        "expires": expires,
+        "httpOnly": bool(c.get("httpOnly")),
+        "secure": secure,
+        "sameSite": same_site,
+    }
+
+
+def collect_google_cookies(profile_dir):
+    """Ambil cookies Google terbaru secara otomatis setiap request.
+
+    Menggabungkan cookies dari:
+    1. google_cookies.json (portable, mis. untuk VPS) — dimuat DULU sebagai dasar
+    2. firefox_profile/cookies.sqlite (hasil solve.py — berisi GOOGLE_ABUSE_EXEMPTION)
+       dimuat BELAKANGAN sehingga MENANG bila ada duplikat. Profil live lebih tepercaya
+       daripada JSON yang bisa basi/tidak lengkap (mis. tanpa cookie exemption).
+    """
+    merged = {}
+
+    # 1. Dari google_cookies.json sebagai dasar (bisa basi/tidak lengkap)
+    if os.path.exists(COOKIES_JSON_FILE):
+        try:
+            with open(COOKIES_JSON_FILE, "r", encoding="utf-8") as f:
+                for c in json.load(f).get("cookies", []):
+                    cookie = _sanitize_cookie(c)
+                    if cookie["name"] and cookie["domain"]:
+                        merged[(cookie["name"], cookie["domain"], cookie["path"])] = cookie
+        except Exception as e:
+            print(f"[Cookies] Gagal membaca {COOKIES_JSON_FILE}: {e}")
+
+    # 2. Dari profil Firefox (dibaca ulang tiap request; MENANG atas JSON yang basi)
+    try:
+        from pathlib import Path
+        from cookie_helper import get_google_cookies
+        for c in get_google_cookies(Path(profile_dir)):
+            cookie = _sanitize_cookie(c)
+            if cookie["name"] and cookie["domain"]:
+                merged[(cookie["name"], cookie["domain"], cookie["path"])] = cookie
+    except Exception as e:
+        print(f"[Cookies] Gagal membaca cookies dari firefox_profile: {e}")
+
+    # Cerminkan GOOGLE_ABUSE_EXEMPTION yang masih valid ke KEDUA domain Google.
+    # Google men-set cookie ini pada domain penyaji /sorry (biasanya .google.com),
+    # padahal bot menavigasi google.co.id — cookie domain lain tak akan terkirim.
+    # Token exemption terikat IP (validasi server-side), jadi aman disalin lintas domain.
+    def _valid(c):
+        exp = c.get("expires")
+        try:
+            return exp is None or float(exp) < 0 or float(exp) > time.time()
+        except (ValueError, TypeError):
+            return True
+
+    valid_ex = next((c for c in merged.values()
+                     if c["name"] == "GOOGLE_ABUSE_EXEMPTION" and _valid(c)), None)
+    if valid_ex:
+        for dom in (".google.com", ".google.co.id"):
+            key = ("GOOGLE_ABUSE_EXEMPTION", dom, valid_ex.get("path", "/") or "/")
+            existing = merged.get(key)
+            if existing is None or not _valid(existing):
+                clone = dict(valid_ex)
+                clone["domain"] = dom
+                merged[key] = clone
+        print("[Cookies] GOOGLE_ABUSE_EXEMPTION valid dicerminkan ke .google.com & .google.co.id")
+
+    return list(merged.values())
+
+
+def save_google_cookies(all_cookies):
+    """Simpan cookies Google terbaru dari sesi browser kembali ke google_cookies.json.
+
+    HANYA dipanggil setelah pencarian benar-benar sukses (ada hasil), agar
+    cookies dari sesi yang kena CAPTCHA/terblokir tidak menimpa cookies bagus
+    hasil solver.
+    """
+    try:
+        google_cookies = [
+            _sanitize_cookie(c) for c in (all_cookies or [])
+            if "google." in (c.get("domain") or "")
+        ]
+        if not google_cookies:
+            return
+        with open(COOKIES_JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump({"cookies": google_cookies, "origins": []}, f, indent=2, ensure_ascii=False)
+        print(f"[Cookies] {len(google_cookies)} cookies Google terbaru otomatis disimpan ke google_cookies.json")
+    except Exception as e:
+        print(f"[Cookies] Gagal menyimpan cookies terbaru: {e}")
+
+
 def get_normalized_proxies():
     """Menormalisasi PROXY agar kompatibel dengan requests (dict) dan ddgs (string)."""
     if not PROXY:
@@ -382,11 +546,13 @@ async def get_top5(keyword):
     # 1. Coba menggunakan Playwright untuk mengakses Google secara langsung
     # Coba hingga 3 kali dengan User-Agent berbeda dan IP proxy yang berotasi
     for attempt in range(1, 4):
-        # Pilih User-Agent perangkat mobile secara acak untuk percobaan ini
-        ua = random.choice(MOBILE_USER_AGENTS)
+        # Pakai satu perangkat KONSISTEN (bukan acak) agar tidak terlihat seperti
+        # 1 profil memakai puluhan perangkat berbeda -> pemicu CAPTCHA.
+        ua = get_stable_ua()
         
         playwright_proxy = None
-        if ddgs_proxy and attempt < 3:
+        use_proxy_this_attempt = bool(ddgs_proxy and attempt < 3 and USE_PROXY_FOR_GOOGLE)
+        if use_proxy_this_attempt:
             print(f"[Direct Search] Percobaan {attempt}/3 (Dengan Proxy): Menghubungi Google dengan perangkat: {ua}")
             try:
                 parsed = urlparse(ddgs_proxy)
@@ -399,11 +565,23 @@ async def get_top5(keyword):
                 print(f"[Warning] Gagal memparsing proxy untuk Playwright: {pe}")
                 playwright_proxy = None
         else:
-            proxy_log_type = "Tanpa Proxy (Penyelamat)" if ddgs_proxy else "Tanpa Proxy"
+            if not USE_PROXY_FOR_GOOGLE and ddgs_proxy:
+                proxy_log_type = "IP Langsung (proxy Google dimatikan)"
+            elif ddgs_proxy:
+                proxy_log_type = "Tanpa Proxy (Penyelamat)"
+            else:
+                proxy_log_type = "Tanpa Proxy"
             print(f"[Direct Search] Percobaan {attempt}/3 ({proxy_log_type}): Menghubungi Google dengan perangkat: {ua}")
-        
+
+        # Selalu pakai profil utama (berisi cookies exemption hasil solve CAPTCHA)
+        # dan injeksi cookies. INILAH yang memungkinkan browser headless lolos
+        # CAPTCHA di IP rumah selama exemption dari solve.py masih berlaku
+        # (tes membuktikan: tanpa cookie exemption, headless selalu kena CAPTCHA).
+        active_profile_dir = profile_dir
+        inject_cookies = True
+
         # Hapus file parent.lock jika ada sisa dari Windows/crash sebelumnya agar tidak crash di Linux/VPS
-        lock_file = os.path.join(profile_dir, "parent.lock")
+        lock_file = os.path.join(active_profile_dir, "parent.lock")
         if os.path.exists(lock_file):
             try:
                 os.remove(lock_file)
@@ -414,8 +592,8 @@ async def get_top5(keyword):
             async with async_playwright() as p:
                 # Gunakan launch_persistent_context agar sesi cookies tersimpan dan bisa dipakai kembali
                 context = await p.firefox.launch_persistent_context(
-                    user_data_dir=profile_dir,
-                    headless=True,
+                    user_data_dir=active_profile_dir,
+                    headless=HEADLESS_BROWSER,
                     proxy=playwright_proxy,
                     user_agent=ua,
                     viewport={"width": 375, "height": 667},
@@ -427,23 +605,96 @@ async def get_top5(keyword):
                 # Terapkan stealth agar tidak terdeteksi headless
                 await Stealth().apply_stealth_async(page)
                 
-                # Muat cookies Google tambahan jika ada google_cookies.json (hasil dari Puppeteer)
-                cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_cookies.json")
-                if os.path.exists(cookies_file):
+                # Ambil cookies Google terbaru secara OTOMATIS setiap request
+                # (gabungan firefox_profile/cookies.sqlite + google_cookies.json).
+                # Untuk percobaan tanpa-proxy (IP rumah bersih), injeksi dilewati.
+                cookies = collect_google_cookies(profile_dir) if inject_cookies else []
+                if cookies:
                     try:
-                        with open(cookies_file, "r", encoding="utf-8") as f:
-                            cookie_data = json.load(f)
-                            cookies = cookie_data.get("cookies", [])
-                            if cookies:
-                                await context.add_cookies(cookies)
-                                print(f"[Direct Search] Berhasil menginjeksi {len(cookies)} cookies dari google_cookies.json")
+                        await context.add_cookies(cookies)
+                        print(f"[Direct Search] Otomatis menginjeksi {len(cookies)} cookies Google terbaru")
                     except Exception as ce:
-                        print(f"[Warning] Gagal menginjeksi cookies dari google_cookies.json: {ce}")
+                        # Jika gagal batch, injeksi satu per satu agar cookie rusak tidak menggagalkan semua
+                        injected = 0
+                        for c in cookies:
+                            try:
+                                await context.add_cookies([c])
+                                injected += 1
+                            except Exception:
+                                pass
+                        print(f"[Direct Search] Injeksi parsial: {injected}/{len(cookies)} cookies berhasil ({ce})")
                 
-                # Buka google search (tanpa &num=50 untuk mengurangi resiko captcha)
-                google_url = f"https://www.google.co.id/search?q={keyword}"
-                await page.goto(google_url, wait_until="domcontentloaded", timeout=20000)
-                
+                # JANGAN buka URL /search langsung — Google langsung melempar ke
+                # /sorry/index. Buka BERANDA dulu, lalu ketik keyword seperti manusia.
+                await page.goto("https://www.google.co.id/", wait_until="domcontentloaded", timeout=20000)
+
+                # Tangani halaman consent/persetujuan cookie jika muncul
+                if "consent.google" in page.url:
+                    for sel in [
+                        "button:has-text('Terima semua')",
+                        "button:has-text('Accept all')",
+                        "button:has-text('Setuju')",
+                        "button[aria-label*='Accept']",
+                        "form[action*='consent'] button",
+                    ]:
+                        try:
+                            btn = await page.query_selector(sel)
+                            if btn:
+                                await btn.click()
+                                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                                break
+                        except Exception:
+                            pass
+
+                # Jika beranda saja sudah kena blokir CAPTCHA
+                if "sorry/index" in page.url:
+                    print(f"[WARNING] Percobaan {attempt} terdeteksi CAPTCHA Google di beranda!")
+                    await notify_captcha_needed()
+                    await context.close()
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                    continue
+
+                # Ketik keyword di kolom pencarian secara manusiawi lalu tekan Enter
+                search_box = None
+                for sel in ["textarea[name='q']", "input[name='q']"]:
+                    try:
+                        search_box = await page.wait_for_selector(sel, timeout=5000)
+                        if search_box:
+                            break
+                    except Exception:
+                        search_box = None
+
+                if search_box:
+                    await search_box.click()
+                    await page.wait_for_timeout(random.uniform(200, 500))
+                    # Ketik per karakter dengan jeda acak agar mirip pengetikan manusia
+                    await search_box.type(keyword, delay=random.uniform(90, 190))
+                    await page.wait_for_timeout(random.uniform(300, 800))
+                    await search_box.press("Enter")
+                    # Pastikan Enter benar-benar men-submit (URL pindah ke /search)
+                    submitted = True
+                    try:
+                        await page.wait_for_url("**/search**", timeout=15000)
+                    except Exception:
+                        submitted = False
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    if not submitted and "/search" not in page.url:
+                        # Enter tidak submit — fallback klik tombol cari atau URL langsung
+                        print(f"[INFO] Percobaan {attempt}: Enter tidak men-submit, memakai URL langsung.")
+                        try:
+                            await page.goto(f"https://www.google.co.id/search?q={keyword}",
+                                            wait_until="domcontentloaded", timeout=20000)
+                        except Exception:
+                            pass
+                else:
+                    # Fallback terakhir jika kolom pencarian tidak ketemu
+                    print(f"[INFO] Percobaan {attempt}: kolom pencarian tidak ditemukan, memakai URL langsung.")
+                    await page.goto(f"https://www.google.co.id/search?q={keyword}",
+                                    wait_until="domcontentloaded", timeout=20000)
+
                 # Pastikan tidak diarahkan ke halaman retry/enablejs atau sorry/index
                 current_url = page.url
                 if "sorry/index" in current_url:
@@ -462,6 +713,13 @@ async def get_top5(keyword):
                 await page.wait_for_timeout(2000)
                 
                 html_content = await page.content()
+
+                # Ambil snapshot cookies sesi ini — baru DISIMPAN nanti jika pencarian sukses
+                try:
+                    session_cookies = await context.cookies()
+                except Exception:
+                    session_cookies = []
+
                 await context.close()
                 
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -471,7 +729,18 @@ async def get_top5(keyword):
             # Cari link hasil penelusuran yang valid (non-Google, non-Youtube, dll.)
             for a in soup.find_all('a', href=True):
                 href = a['href']
-                
+
+                # Google sering membungkus link hasil dalam redirect: /url?q=<target>&...
+                # Link seperti ini diawali "/url", bukan "http", jadi harus diurai dulu
+                # agar tidak terbuang oleh filter di bawah (penyebab 0 hasil).
+                if href.startswith('/url?') or href.startswith('/url;'):
+                    try:
+                        real = parse_qs(urlparse(href).query).get('q', [None])[0]
+                        if real and real.startswith('http'):
+                            href = real
+                    except Exception:
+                        pass
+
                 if href.startswith('http') and 'google.' not in href and 'youtube.com' not in href and 'support.google.com' not in href and 'gstatic.com' not in href:
                     domain = get_domain(href)
                     title = clean_google_title(a, href, domain)
@@ -486,6 +755,8 @@ async def get_top5(keyword):
                         
             if len(top5) >= 3:
                 print(f"[Success] Berhasil mengambil {len(top5)} link secara langsung dari Google pada percobaan {attempt}.")
+                # Pencarian sukses — sekarang aman menyimpan cookies terbaru sesi ini
+                save_google_cookies(session_cookies)
                 # Cek status online secara paralel
                 status_tasks = [check_url_online_async(r["url"]) for r in top5]
                 statuses = await asyncio.gather(*status_tasks)
@@ -505,6 +776,26 @@ async def get_top5(keyword):
                 return top5, "Google"
             else:
                 print(f"[INFO] Percobaan {attempt}: Jumlah link hasil pencarian langsung kurang ({len(top5)}) atau terblokir.")
+                # === DIAGNOSTIK: cari tahu kenapa 0 hasil ===
+                try:
+                    title_txt = soup.title.get_text(strip=True) if soup.title else "(tanpa title)"
+                    total_a = len(soup.find_all('a', href=True))
+                    on_search = "/search" in current_url
+                    print(f"[DEBUG] URL akhir : {current_url}")
+                    print(f"[DEBUG] Title     : {title_txt}")
+                    print(f"[DEBUG] Di /search: {on_search} | total <a>: {total_a} | panjang HTML: {len(html_content)}")
+                    if not on_search:
+                        print("[DEBUG] -> Belum sampai halaman hasil (kemungkinan masih beranda / pencarian tidak ter-submit).")
+                    elif total_a < 5:
+                        print("[DEBUG] -> Di /search tapi link sangat sedikit (kemungkinan halaman blokir/consent).")
+                    else:
+                        print("[DEBUG] -> Di /search & banyak link, tapi tak lolos filter (struktur DOM berubah).")
+                    debug_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_last_attempt.html")
+                    with open(debug_file, "w", encoding="utf-8") as df:
+                        df.write(html_content)
+                    print(f"[DEBUG] HTML halaman terakhir disimpan ke: {debug_file}")
+                except Exception as de:
+                    print(f"[DEBUG] Gagal menulis diagnostik: {de}")
                 # Kemungkinan kena CAPTCHA invisible / halaman kosong Google
                 if len(top5) == 0 and attempt == 3:
                     print("[WARNING] Semua percobaan Google gagal dengan 0 hasil — kemungkinan kena CAPTCHA!")
@@ -731,8 +1022,8 @@ async def cron_job(application):
                 else:
                     print(f"[Cron] Gagal memindai {kw} pada pengecekan otomatis berkala.")
                 
-                # Jeda 3-6 detik antar kata kunci agar aman dari rate limit
-                await asyncio.sleep(random.uniform(3.0, 6.0))
+                # Jeda antar kata kunci agar laju tidak seperti bot (kurangi CAPTCHA)
+                await asyncio.sleep(random.uniform(SCAN_DELAY_MIN, SCAN_DELAY_MAX))
 
 async def post_init(application):
     global _bot_app_ref
@@ -900,7 +1191,7 @@ async def scan_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
         else:
             await update.message.reply_text(f"❌ Gagal memindai keyword: <code>{html.escape(kw)}</code>", parse_mode="HTML")
-        await asyncio.sleep(random.uniform(3.0, 5.0))
+        await asyncio.sleep(random.uniform(SCAN_DELAY_MIN, SCAN_DELAY_MAX))
 
 async def cek_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyword = update.message.text.strip()

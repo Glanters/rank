@@ -56,6 +56,19 @@ def get_google_cookies(profile_path: Path) -> List[Dict]:
         rows = cursor.fetchall()
         
         for name, value, host, path, expiry, is_secure, is_http_only, same_site in rows:
+            secure = bool(is_secure)
+            # Firefox sameSite: 3 = Strict, 1/2 = Lax, 0/256/lainnya = unset.
+            # PENTING: sameSite "None" WAJIB secure=True; jika tidak, browser
+            # membuang cookie saat injeksi. Karena kita hanya navigasi first-party
+            # ke google.co.id (cookie Lax tetap terkirim), default aman = "Lax".
+            if same_site == 3:
+                ss = "Strict"
+            elif same_site in (1, 2):
+                ss = "Lax"
+            elif secure:
+                ss = "None"   # boleh None hanya bila cookie memang Secure
+            else:
+                ss = "Lax"    # None + insecure ilegal -> pakai Lax agar tidak dibuang
             cookies.append({
                 "name": name,
                 "value": value,
@@ -63,8 +76,8 @@ def get_google_cookies(profile_path: Path) -> List[Dict]:
                 "path": path,
                 "expires": normalize_expiry(expiry),
                 "httpOnly": bool(is_http_only),
-                "secure": bool(is_secure),
-                "sameSite": "Lax" if same_site == 2 else ("Strict" if same_site == 3 else "None")
+                "secure": secure,
+                "sameSite": ss
             })
             
         conn.close()

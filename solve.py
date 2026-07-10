@@ -37,14 +37,18 @@ async def main():
             )
             page = context.pages[0] if context.pages else await context.new_page()
             
-            print("Membuka Google Search...")
-            await page.goto("https://www.google.co.id/search?q=wdbos", wait_until="domcontentloaded")
-            
+            # Buka BERANDA Google dulu (bukan URL pencarian langsung) agar tidak
+            # langsung dilempar ke halaman blokir /sorry/index
+            print("Membuka beranda Google...")
+            await page.goto("https://www.google.co.id/", wait_until="domcontentloaded")
+
             print("\n=======================================================")
             print(" PETUNJUK:")
-            print(" 1. Selesaikan centang CAPTCHA (Saya Bukan Robot) di browser.")
-            print(" 2. Setelah hasil pencarian Google muncul, tutup jendela")
-            print("    browser atau tekan Ctrl+C di terminal ini.")
+            print(" 1. Ketik pencarian secara MANUAL di kolom pencarian Google")
+            print("    (contoh: wdbos) lalu tekan Enter di browser.")
+            print(" 2. Jika muncul CAPTCHA, selesaikan centangnya sampai hasil")
+            print("    pencarian tampil normal.")
+            print(" 3. Setelah itu tutup jendela browser atau tekan Ctrl+C di sini.")
             print("=======================================================\n")
             
             # Keep browser open until closed or interrupted

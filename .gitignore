@@ -1,8 +1,11 @@
 __pycache__/
 *.pyc
 firefox_profile/
+firefox_profile_direct/
 captcha.png
 *.log
+debug_last_attempt.html
+device_ua.txt
 keywords.json
 google_cookies.json
 node_modules/
