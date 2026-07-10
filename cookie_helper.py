@@ -7,7 +7,9 @@ compatible with Playwright's storage_state.
 
 import os
 import json
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import List, Dict
 
@@ -27,16 +29,43 @@ def normalize_expiry(expiry_val):
         return expiry_val
 
 def get_google_cookies(profile_path: Path) -> List[Dict]:
-    """Read Google cookies from the cookies.sqlite database inside the given profile path."""
+    """Read Google cookies from the cookies.sqlite database inside the given profile path.
+
+    Firefox yang sedang berjalan MENGUNCI cookies.sqlite, sehingga membaca file itu
+    langsung memicu 'database is locked'. Untuk itu DB (beserta -wal & -shm) disalin
+    dulu ke lokasi sementara, baru dibaca dari salinan tsb.
+    """
     db_path = profile_path / "cookies.sqlite"
     if not db_path.exists():
         print(f"[cookie_helper] No cookies.sqlite database found at: {db_path}")
         return []
-        
+
+    # Salin DB + WAL + SHM ke temp agar tidak bentrok lock dengan Firefox aktif.
+    tmp_dir = tempfile.mkdtemp(prefix="ckread_")
+    read_path = str(db_path)
+    try:
+        tmp_db = os.path.join(tmp_dir, "cookies.sqlite")
+        shutil.copy2(str(db_path), tmp_db)
+        for ext in ("-wal", "-shm"):
+            src = str(db_path) + ext
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, tmp_db + ext)
+                except Exception:
+                    pass
+        read_path = tmp_db
+    except Exception as e:
+        print(f"[cookie_helper] Gagal menyalin DB (baca langsung, mode immutable): {e}")
+
     cookies = []
+    conn = None
     # Open SQLite database in read-only mode using a URI
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        if read_path == str(db_path):
+            # Fallback: baca file asli dengan immutable=1 agar tidak kena lock
+            conn = sqlite3.connect(f"file:{read_path}?immutable=1", uri=True)
+        else:
+            conn = sqlite3.connect(f"file:{read_path}?mode=ro", uri=True)
         cursor = conn.cursor()
         
         # Check if table exists
@@ -80,11 +109,17 @@ def get_google_cookies(profile_path: Path) -> List[Dict]:
                 "sameSite": ss
             })
             
-        conn.close()
         print(f"[cookie_helper] Extracted {len(cookies)} Google cookies successfully.")
     except Exception as e:
         print(f"[cookie_helper] Error reading cookies: {e}")
-        
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     return cookies
 
 def generate_storage_state(profile_path: Path, output_file: Path) -> bool:
