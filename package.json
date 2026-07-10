@@ -1,0 +1,13 @@
+{
+  "name": "google-rank-tracker-solve",
+  "version": "1.0.0",
+  "description": "Puppeteer helper to solve google captchas",
+  "main": "solve_puppeteer.js",
+  "scripts": {
+    "solve": "node solve_puppeteer.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.0.0",
+    "puppeteer": "^22.0.0"
+  }
+}

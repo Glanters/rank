@@ -427,6 +427,19 @@ async def get_top5(keyword):
                 # Terapkan stealth agar tidak terdeteksi headless
                 await Stealth().apply_stealth_async(page)
                 
+                # Muat cookies Google tambahan jika ada google_cookies.json (hasil dari Puppeteer)
+                cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_cookies.json")
+                if os.path.exists(cookies_file):
+                    try:
+                        with open(cookies_file, "r", encoding="utf-8") as f:
+                            cookie_data = json.load(f)
+                            cookies = cookie_data.get("cookies", [])
+                            if cookies:
+                                await context.add_cookies(cookies)
+                                print(f"[Direct Search] Berhasil menginjeksi {len(cookies)} cookies dari google_cookies.json")
+                    except Exception as ce:
+                        print(f"[Warning] Gagal menginjeksi cookies dari google_cookies.json: {ce}")
+                
                 # Buka google search (tanpa &num=50 untuk mengurangi resiko captcha)
                 google_url = f"https://www.google.co.id/search?q={keyword}"
                 await page.goto(google_url, wait_until="domcontentloaded", timeout=20000)
@@ -945,14 +958,26 @@ async def solved_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookies = get_google_cookies(Path(profile_dir))
     cookies_count = len(cookies)
     
+    # Hitung jumlah cookies dari google_cookies.json
+    json_cookies_count = 0
+    json_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_cookies.json")
+    if os.path.exists(json_file):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+                json_cookies_count = len(json_data.get("cookies", []))
+        except Exception:
+            pass
+            
     _captcha_notified = False  # Reset status notifikasi CAPTCHA
     
     status_msg = (
         "✅ <b>Sesi CAPTCHA Berhasil Direset!</b>\n"
         "──────────────────────────\n"
         f"• Status Lock File: {'🗑️ Dihapus' if removed_lock else '✔️ Bersih (Tidak ada lock)'}\n"
-        f"• Jumlah Google Cookies Terdeteksi: <b>{cookies_count}</b>\n\n"
-        "Bot akan mencoba mengakses Google kembali pada pencarian berikutnya menggunakan profil baru yang Anda upload."
+        f"• Firefox Profile Cookies: <b>{cookies_count}</b>\n"
+        f"• JSON File Cookies: <b>{json_cookies_count}</b>\n\n"
+        "Bot akan menggunakan cookies dari profil Firefox dan google_cookies.json pada pencarian berikutnya."
     )
     
     await update.message.reply_text(status_msg, parse_mode="HTML")
